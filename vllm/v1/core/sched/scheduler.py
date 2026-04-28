@@ -63,6 +63,9 @@ from vllm.v1.utils import record_function_or_nullcontext
 
 logger = init_logger(__name__)
 
+import os
+
+VLLM_PROFILE = os.getenv("VLLM_PROFILE", "0") == "1"
 
 class Scheduler(SchedulerInterface):
     def __init__(
@@ -295,6 +298,68 @@ class Scheduler(SchedulerInterface):
 
         self._pause_state: PauseState = PauseState.UNPAUSED
 
+        # Debug/tracing: per-request token fate accumulator.
+        # This is intentionally independent from existing gpu-kv-trace and
+        # scheduler-compute-trace logs, so old parsers remain compatible.
+        self._token_fate_trace: dict[str, dict[str, int]] = {}
+
+    def _update_token_fate_trace(
+        self,
+        request_id: str,
+        prompt_total: int = 0,
+        gpu_hit: int = 0,
+        external_hit: int = 0,
+        prefill_compute: int = 0,
+        decode_compute: int = 0,
+    ) -> None:
+        fate = self._token_fate_trace.setdefault(
+            request_id,
+            {
+                "prompt_total": 0,
+                "gpu_hit": 0,
+                "external_hit": 0,
+                "prefill_compute": 0,
+                "decode_compute": 0,
+            },
+        )
+        if prompt_total:
+            fate["prompt_total"] = max(fate["prompt_total"], prompt_total)
+        if gpu_hit:
+            fate["gpu_hit"] = max(fate["gpu_hit"], gpu_hit)
+        if external_hit:
+            fate["external_hit"] = max(fate["external_hit"], external_hit)
+        if prefill_compute:
+            fate["prefill_compute"] += prefill_compute
+        if decode_compute:
+            fate["decode_compute"] += decode_compute
+
+    def _log_token_fate_trace(self, request_id: str) -> None:
+        if not VLLM_PROFILE:
+            return
+        fate = self._token_fate_trace.pop(request_id, None)
+        if not fate:
+            return
+        prompt_total = fate["prompt_total"]
+        gpu_hit = fate["gpu_hit"]
+        external_hit = fate["external_hit"]
+        prefill_compute = fate["prefill_compute"]
+        decode_compute = fate["decode_compute"]
+        prompt_accounted = gpu_hit + external_hit + prefill_compute
+        prompt_delta = prompt_total - prompt_accounted
+        logger.info(
+            "[scheduler-token-fate] reqid=%s prompt_total=%d gpu_hit=%d "
+            "external_hit=%d prefill_compute=%d decode_compute=%d "
+            "prompt_accounted=%d prompt_delta=%d",
+            request_id,
+            prompt_total,
+            gpu_hit,
+            external_hit,
+            prefill_compute,
+            decode_compute,
+            prompt_accounted,
+            prompt_delta,
+        )
+
     def _mamba_block_aligned_split(
         self,
         request: Request,
@@ -514,6 +579,31 @@ class Scheduler(SchedulerInterface):
             request_id = request.request_id
             req_to_new_blocks[request_id] = new_blocks
             num_scheduled_tokens[request_id] = num_new_tokens
+            # Split scheduled model compute into prefill vs decode/output tokens.
+            # This keeps prompt-token accounting comparable with gpu/external hits.
+            prefill_end = request.num_prompt_tokens
+            compute_start = request.num_computed_tokens
+            compute_end = request.num_computed_tokens + num_new_tokens
+            scheduler_prefill_compute = max(
+                min(compute_end, prefill_end) - compute_start, 0
+            )
+            scheduler_decode_compute = num_new_tokens - scheduler_prefill_compute
+            if VLLM_PROFILE:
+                logger.info(
+                    "[scheduler-compute-trace] reqid=%s "
+                    "scheduler_prefill_compute=%d scheduler_decode_compute=%d "
+                    "scheduler_total_compute=%d",
+                    request_id,
+                    scheduler_prefill_compute,
+                    scheduler_decode_compute,
+                    num_new_tokens,
+                )
+            self._update_token_fate_trace(
+                request_id,
+                prompt_total=request.num_prompt_tokens,
+                prefill_compute=scheduler_prefill_compute,
+                decode_compute=scheduler_decode_compute,
+            )
             token_budget -= num_new_tokens
             req_index += 1
 
@@ -635,6 +725,32 @@ class Scheduler(SchedulerInterface):
                             request.num_tokens - num_new_local_computed_tokens
                         )
                         connector_prefix_cache_hits = num_external_computed_tokens
+
+                    # GPU KV cache tracing.
+                    # num_new_local_computed_tokens is the local vLLM GPU KV /
+                    # prefix-cache hit. num_external_computed_tokens is matched
+                    # by the external KV connector, such as LMCache.
+                    total_tokens_for_trace = request.num_tokens
+                    gpu_hit_tokens_for_trace = num_new_local_computed_tokens
+                    gpu_miss_tokens_for_trace = max(
+                        total_tokens_for_trace - gpu_hit_tokens_for_trace, 0
+                    )
+                    if VLLM_PROFILE:
+                        logger.info(
+                            "[gpu-kv-trace] reqid=%s total=%d gpu_hit=%d "
+                            "gpu_miss=%d external_hit=%d",
+                            request.request_id,
+                            total_tokens_for_trace,
+                            gpu_hit_tokens_for_trace,
+                            gpu_miss_tokens_for_trace,
+                            num_external_computed_tokens,
+                        )
+                    self._update_token_fate_trace(
+                        request.request_id,
+                        prompt_total=request.num_prompt_tokens,
+                        gpu_hit=gpu_hit_tokens_for_trace,
+                        external_hit=num_external_computed_tokens,
+                    )
 
                     # Total computed tokens (local + external).
                     num_computed_tokens = (
@@ -831,6 +947,31 @@ class Scheduler(SchedulerInterface):
                     request_id
                 )
                 num_scheduled_tokens[request_id] = num_new_tokens
+                # Split scheduled model compute into prefill vs decode/output tokens.
+                # At this point num_computed_tokens includes local/external cache hits.
+                prefill_end = request.num_prompt_tokens
+                compute_start = num_computed_tokens
+                compute_end = num_computed_tokens + num_new_tokens
+                scheduler_prefill_compute = max(
+                    min(compute_end, prefill_end) - compute_start, 0
+                )
+                scheduler_decode_compute = num_new_tokens - scheduler_prefill_compute
+                if VLLM_PROFILE:
+                    logger.info(
+                        "[scheduler-compute-trace] reqid=%s "
+                        "scheduler_prefill_compute=%d scheduler_decode_compute=%d "
+                        "scheduler_total_compute=%d",
+                        request_id,
+                        scheduler_prefill_compute,
+                        scheduler_decode_compute,
+                        num_new_tokens,
+                    )
+                self._update_token_fate_trace(
+                    request_id,
+                    prompt_total=request.num_prompt_tokens,
+                    prefill_compute=scheduler_prefill_compute,
+                    decode_compute=scheduler_decode_compute,
+                )
                 token_budget -= num_new_tokens
                 request.status = RequestStatus.RUNNING
                 request.num_computed_tokens = num_computed_tokens
@@ -1822,6 +1963,7 @@ class Scheduler(SchedulerInterface):
     def _free_request(
         self, request: Request, delay_free_blocks: bool = False
     ) -> dict[str, Any] | None:
+        self._log_token_fate_trace(request.request_id)
         assert request.is_finished()
 
         connector_delay_free_blocks, kv_xfer_params = self._connector_finished(request)
