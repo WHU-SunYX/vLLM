@@ -313,7 +313,7 @@ class SparseSSDAttentionImpl(AttentionImpl[AttentionMetadata]):
                     active_reqs_for_log,
                 )
             try:
-                vllm_ops.sparse_ssd_attention(
+                vllm_ops.sparse_flash_attention(
                     output,
                     query,
                     kv_cache,
@@ -334,7 +334,7 @@ class SparseSSDAttentionImpl(AttentionImpl[AttentionMetadata]):
                 return output
             except Exception:
                 logger.exception(
-                    "[sparse-attn] production sparse_ssd_attention custom op "
+                    "[sparse-attn] production sparse_flash_attention custom op "
                     "failed for layer=%s",
                     layer_name,
                 )

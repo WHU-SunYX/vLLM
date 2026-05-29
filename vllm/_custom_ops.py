@@ -3888,6 +3888,58 @@ if hasattr(torch.ops._C, "minimax_allreduce_rms_qk"):
         )
 
 
+
+# AI-SSD sparse FlashAttention-style op wrapper.
+def sparse_flash_attention(
+    out: torch.Tensor,
+    query: torch.Tensor,
+    kv_cache: torch.Tensor,
+    active_reqs: torch.Tensor | None,
+    req_token_lens: torch.Tensor,
+    req_vllm_cached_tokens: torch.Tensor,
+    req_lmcache_cached_tokens: torch.Tensor,
+    req_slot_lens: torch.Tensor,
+    slot_mapping_table: torch.Tensor,
+    selected_block_table: torch.Tensor,
+    selected_block_lens: torch.Tensor,
+    selected_ready_flags: torch.Tensor,
+    block_size: int,
+    chunk_size: int,
+    top_n_chunks: int,
+    scale: float,
+) -> None:
+    """Run graph-capturable sparse FlashAttention-style custom op.
+
+    This optimized sparse attention path is independent from the earlier
+    sparse_ssd_attention baseline op.  It consumes stable device tensors plus
+    selected-block metadata prepared by LMCache before model execution.
+    """
+    op = getattr(torch.ops._C, "sparse_flash_attention", None)
+    if op is None:
+        raise RuntimeError(
+            "torch.ops._C.sparse_flash_attention is not registered. "
+            "Build/register vllm/csrc/attention/sparse_flash_attention.cu before "
+            "enabling lmcache.enable_sparse_attention."
+        )
+    op(
+        out,
+        query,
+        kv_cache,
+        active_reqs if active_reqs is not None else torch.zeros((), dtype=torch.int32, device=query.device),
+        req_token_lens,
+        req_vllm_cached_tokens,
+        req_lmcache_cached_tokens,
+        req_slot_lens,
+        slot_mapping_table,
+        selected_block_table,
+        selected_block_lens,
+        selected_ready_flags,
+        block_size,
+        chunk_size,
+        top_n_chunks,
+        scale,
+    )
+
 # AI-SSD sparse attention op wrapper.
 def sparse_ssd_attention(
     out: torch.Tensor,

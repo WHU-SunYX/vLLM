@@ -72,6 +72,18 @@ TORCH_LIBRARY_EXPAND(TORCH_EXTENSION_NAME, ops) {
       "Tensor selected_block_lens, Tensor selected_ready_flags, "
       "int block_size, int chunk_size, int top_n_chunks, float scale) -> ()");
 
+  // Sparse FlashAttention-style selected-load attention. This is the optimized
+  // sparse path; it is independent from the earlier sparse_ssd_attention
+  // baseline implementation.
+  ops.def(
+      "sparse_flash_attention(Tensor(a!) out, Tensor query, Tensor kv_cache, "
+      "Tensor active_reqs, Tensor req_token_lens, Tensor req_vllm_cached_tokens, "
+      "Tensor req_lmcache_cached_tokens, Tensor req_slot_lens, "
+      "Tensor slot_mapping_table, Tensor selected_block_table, "
+      "Tensor selected_block_lens, Tensor selected_ready_flags, "
+      "int block_size, int chunk_size, int top_n_chunks, float scale) -> ()");
+
+
   // Activation ops (quantized only — basic ops moved to _C_stable_libtorch)
   ops.def(
       "silu_and_mul_quant(Tensor! result, Tensor input, Tensor scale) -> ()");

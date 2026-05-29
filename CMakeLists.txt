@@ -310,6 +310,7 @@ set(VLLM_EXT_SRC
   "csrc/attention/paged_attention_v1.cu"
   "csrc/attention/paged_attention_v2.cu"
   "csrc/attention/sparse_ssd_attention.cu"
+  "csrc/attention/sparse_flash_attention.cu"
   "csrc/cuda_view.cu"
   "csrc/quantization/fused_kernels/fused_silu_mul_block_quant.cu"
   "csrc/quantization/activation_kernels.cu"
