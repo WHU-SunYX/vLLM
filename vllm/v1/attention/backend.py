@@ -408,6 +408,21 @@ class CommonAttentionMetadata:
     decode rows (assumes every draft was accepted). Not safe for kernels
     that need exact per-row context lengths on decode rows."""
 
+    # Optional AI-SSD sparse KV metadata. These fields are populated by the
+    # LMCache sparse KV hook when enabled. They are ignored by normal attention
+    # backends and therefore do not affect the default full-attention path.
+    sparse_kv_enabled: bool = False
+    sparse_block_table_tensor: torch.Tensor | None = None
+    sparse_block_lens: torch.Tensor | None = None
+    sparse_chunk_scores: torch.Tensor | None = None
+    # [num_reqs, max_selected_chunks, 2], token_start/token_end per selected chunk.
+    sparse_token_ranges_tensor: torch.Tensor | None = None
+    # [num_reqs, max_selected_chunks, 2], slot_start/slot_end per selected chunk.
+    sparse_slot_ranges_tensor: torch.Tensor | None = None
+    # [num_reqs], number of selected chunks per request.
+    sparse_chunk_lens: torch.Tensor | None = None
+    sparse_selector_result: Any | None = None
+
     # WARNING: Deprecated fields. Will be removed in a future release (v0.15.0)
     _seq_lens_cpu: torch.Tensor | None = None
     _num_computed_tokens_cpu: torch.Tensor | None = None
@@ -490,6 +505,14 @@ class CommonAttentionMetadata:
             dcp_local_seq_lens=maybe_slice_reqs(self.dcp_local_seq_lens),
             dcp_local_seq_lens_cpu=maybe_slice_reqs(self.dcp_local_seq_lens_cpu),
             is_prefilling=maybe_slice_reqs(self.is_prefilling),
+            sparse_kv_enabled=self.sparse_kv_enabled,
+            sparse_block_table_tensor=self.sparse_block_table_tensor,
+            sparse_block_lens=self.sparse_block_lens,
+            sparse_chunk_scores=self.sparse_chunk_scores,
+            sparse_token_ranges_tensor=self.sparse_token_ranges_tensor,
+            sparse_slot_ranges_tensor=self.sparse_slot_ranges_tensor,
+            sparse_chunk_lens=self.sparse_chunk_lens,
+            sparse_selector_result=self.sparse_selector_result,
         )
 
 

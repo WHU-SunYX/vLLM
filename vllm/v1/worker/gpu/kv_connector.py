@@ -41,6 +41,9 @@ class KVConnector:
     def no_forward(self, scheduler_output: "SchedulerOutput") -> ModelRunnerOutput:
         return EMPTY_MODEL_RUNNER_OUTPUT
 
+    def prepare_sparse_kv_step(self, scheduler_output: "SchedulerOutput") -> None:
+        pass
+
     def set_disabled(self, disabled: bool) -> None:
         pass
 
@@ -68,12 +71,26 @@ class ActiveKVConnector(KVConnector):
         self.kv_connector.handle_preemptions(kv_connector_metadata)
         self.kv_connector.bind_connector_metadata(kv_connector_metadata)
 
-        # TODO: sort out KV Connectors' use of forward_context
+        # TODO: sort out KV Connectors' use of forward_context.
+        # Production sparse SSD attention needs a step-level runtime context
+        # prepared before model execution.  This must not be hidden inside the
+        # Python attention backend because CUDA graph replay will not re-enter
+        # Python for every request.  start_load_kv() records per-request KV
+        # runtime state; prepare_sparse_kv_step() publishes stable tensors/handles
+        # on the ForwardContext/attention metadata for the backend/custom op.
         if is_forward_context_available():
-            self.kv_connector.start_load_kv(get_forward_context())
+            forward_context = get_forward_context()
+            self.kv_connector.start_load_kv(forward_context)
+            prepare = getattr(self.kv_connector, "prepare_sparse_kv_step", None)
+            if prepare is not None:
+                prepare(forward_context, scheduler_output=scheduler_output)
         else:
             with set_forward_context(None, self.vllm_config):
-                self.kv_connector.start_load_kv(get_forward_context())
+                forward_context = get_forward_context()
+                self.kv_connector.start_load_kv(forward_context)
+                prepare = getattr(self.kv_connector, "prepare_sparse_kv_step", None)
+                if prepare is not None:
+                    prepare(forward_context, scheduler_output=scheduler_output)
 
     def post_forward(
         self, finished_req_ids: set[str], wait_for_save: bool = True
@@ -95,6 +112,15 @@ class ActiveKVConnector(KVConnector):
         )
         self.kv_connector.clear_connector_metadata()
         return output
+
+    def prepare_sparse_kv_step(self, scheduler_output: "SchedulerOutput") -> None:
+        if self._disabled:
+            return
+        if not is_forward_context_available():
+            return
+        prepare = getattr(self.kv_connector, "prepare_sparse_kv_step", None)
+        if prepare is not None:
+            prepare(get_forward_context(), scheduler_output=scheduler_output)
 
     def no_forward(self, scheduler_output: "SchedulerOutput") -> ModelRunnerOutput:
         if self._disabled:

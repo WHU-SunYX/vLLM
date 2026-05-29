@@ -2,6 +2,7 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
 from typing import TYPE_CHECKING, Any
+import os
 
 import torch
 import torch.nn as nn
@@ -49,6 +50,217 @@ if TYPE_CHECKING:
     from vllm.model_executor.layers.attention import MLAAttention
 
 logger = init_logger(__name__)
+
+
+_SPARSE_KV_NO_CONNECTOR_LOGGED = False
+_SPARSE_ATTENTION_DISABLED_LOGGED = False
+_SPARSE_ATTENTION_IMPORT_FAILED_LOGGED = False
+_SPARSE_ATTENTION_IMPL = None
+
+
+def _as_bool(value: Any, default: bool = False) -> bool:
+    if value is None:
+        return default
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, (int, float)):
+        return bool(value)
+    if isinstance(value, str):
+        return value.strip().lower() in {"1", "true", "yes", "on", "y"}
+    return bool(value)
+
+
+def _sparse_attention_enabled() -> bool:
+    """Return whether AI-SSD sparse attention should replace full attention.
+
+    Runtime priority:
+      1. env LMCACHE_ENABLE_SPARSE_ATTENTION
+      2. worker LMCache connector sparse_kv_spec.enable_sparse_attention
+      3. current vLLM kv_connector_extra_config
+      4. LMCache config.extra_config
+
+    The worker connector check is important because Attention may be
+    constructed/probed before LMCache worker registration, while the real
+    forward path can read the registered connector reliably.
+    """
+    env_value = os.environ.get("LMCACHE_ENABLE_SPARSE_ATTENTION")
+    if env_value is not None:
+        return _as_bool(env_value, False)
+
+    try:
+        from lmcache.integration.vllm.vllm_v1_adapter import (
+            get_sparse_kv_connector,
+        )
+
+        connector = get_sparse_kv_connector()
+        spec = getattr(connector, "sparse_kv_spec", None) if connector is not None else None
+        if spec is not None and hasattr(spec, "enable_sparse_attention"):
+            return _as_bool(getattr(spec, "enable_sparse_attention"), False)
+    except Exception:
+        pass
+
+    try:
+        vllm_config = get_current_vllm_config()
+        kv_cfg = getattr(vllm_config, "kv_transfer_config", None)
+        kv_extra = getattr(kv_cfg, "kv_connector_extra_config", None) or {}
+        for key in (
+            "lmcache.enable_sparse_attention",
+            "enable_sparse_attention",
+            "lmcache.sparse_attention",
+            "sparse_attention",
+        ):
+            if key in kv_extra:
+                return _as_bool(kv_extra.get(key), False)
+    except Exception:
+        pass
+
+    try:
+        from lmcache.integration.vllm.utils import lmcache_get_or_create_config
+
+        cfg = lmcache_get_or_create_config()
+        extra = getattr(cfg, "extra_config", {}) or {}
+        for key in (
+            "lmcache.enable_sparse_attention",
+            "enable_sparse_attention",
+            "lmcache.sparse_attention",
+            "sparse_attention",
+        ):
+            if key in extra:
+                return _as_bool(extra.get(key), False)
+    except Exception:
+        pass
+
+    return False
+
+
+def _get_sparse_attention_impl():
+    """Load the functional sparse-attention implementation lazily."""
+    global _SPARSE_ATTENTION_IMPL, _SPARSE_ATTENTION_IMPORT_FAILED_LOGGED
+    if _SPARSE_ATTENTION_IMPL is not None:
+        return _SPARSE_ATTENTION_IMPL
+
+    errors: list[str] = []
+    for module_name in (
+        # Current project layout:
+        #   ./vLLM/vllm/v1/attention/backends/sparse_ssd_attn.py
+        "vllm.v1.attention.backends.sparse_ssd_attn",
+        # Alternative/older layouts kept as fallbacks.
+        "lmcache.integration.vllm.sparse_ssd_attn",
+        "vllm.v1.attention.ops.sparse_ssd_attn",
+        "vllm.attention.ops.sparse_ssd_attn",
+        "sparse_ssd_attn",
+    ):
+        try:
+            module = __import__(module_name, fromlist=["SparseSSDAttentionImpl"])
+            impl_cls = getattr(module, "SparseSSDAttentionImpl")
+            _SPARSE_ATTENTION_IMPL = impl_cls()
+            logger.info(
+                "[sparse-attn] loaded SparseSSDAttentionImpl from %s",
+                module_name,
+            )
+            return _SPARSE_ATTENTION_IMPL
+        except Exception as exc:
+            errors.append(f"{module_name}: {exc}")
+
+    if not _SPARSE_ATTENTION_IMPORT_FAILED_LOGGED:
+        logger.warning(
+            "[sparse-attn] sparse attention is enabled but "
+            "SparseSSDAttentionImpl cannot be imported; falling back to full "
+            "attention. Tried: %s",
+            "; ".join(errors),
+        )
+        _SPARSE_ATTENTION_IMPORT_FAILED_LOGGED = True
+    return None
+
+
+def _maybe_run_sparse_attention(
+    layer_name: str,
+    attention_layer: "Attention",
+    query: torch.Tensor,
+    key: torch.Tensor | None,
+    value: torch.Tensor | None,
+    kv_cache: torch.Tensor,
+    attn_metadata: AttentionMetadata,
+    output: torch.Tensor,
+    output_scale: torch.Tensor | None = None,
+    output_block_scale: torch.Tensor | None = None,
+) -> bool:
+    """Run sparse attention when explicitly enabled and metadata is present.
+
+    Returns True when sparse attention wrote `output`, otherwise False so the
+    caller can fall back to the original attention backend.
+    """
+    global _SPARSE_ATTENTION_DISABLED_LOGGED
+
+    if not _sparse_attention_enabled():
+        if not _SPARSE_ATTENTION_DISABLED_LOGGED:
+            logger.info(
+                "[sparse-attn] disabled at runtime. Set "
+                "LMCACHE_ENABLE_SPARSE_ATTENTION=1 or "
+                "kv_connector_extra_config['lmcache.enable_sparse_attention']=true "
+                "to route sparse metadata to SparseSSDAttentionImpl."
+            )
+            _SPARSE_ATTENTION_DISABLED_LOGGED = True
+        return False
+
+    if not getattr(attn_metadata, "sparse_kv_enabled", False):
+        logger.debug(
+            "[sparse-attn] enabled but no sparse metadata for layer=%s; "
+            "falling back to full attention",
+            layer_name,
+        )
+        return False
+
+    sparse_block_table = getattr(attn_metadata, "sparse_block_table_tensor", None)
+    sparse_block_lens = getattr(attn_metadata, "sparse_block_lens", None)
+    if sparse_block_table is None or sparse_block_lens is None:
+        logger.warning(
+            "[sparse-attn] enabled but sparse block metadata is missing for "
+            "layer=%s; falling back to full attention",
+            layer_name,
+        )
+        return False
+
+    impl = _get_sparse_attention_impl()
+    if impl is None:
+        return False
+
+    try:
+        total_blocks = int(sparse_block_lens.sum().item())
+    except Exception:
+        total_blocks = -1
+    logger.info(
+        "[sparse-attn] route layer=%s q_shape=%s selected_reqs=%s "
+        "selected_blocks=%d impl=%s",
+        layer_name,
+        tuple(query.shape),
+        tuple(sparse_block_table.shape) if hasattr(sparse_block_table, "shape") else None,
+        total_blocks,
+        impl.__class__.__name__,
+    )
+
+    try:
+        impl.forward(
+            attention_layer,
+            query,
+            key,
+            value,
+            kv_cache,
+            attn_metadata,
+            output=output,
+            output_scale=output_scale,
+            output_block_scale=output_block_scale,
+            scale=getattr(attention_layer.impl, "scale", None),
+        )
+        return True
+    except Exception:
+        logger.exception(
+            "[sparse-attn] SparseSSDAttentionImpl failed for layer=%s; "
+            "falling back to full attention",
+            layer_name,
+        )
+        return False
+
 
 
 def validate_kv_sharing_target(
@@ -486,6 +698,29 @@ class Attention(nn.Module, AttentionLayerBase):
             key = key.view(-1, self.num_kv_heads, self.head_size)
         if value is not None:
             value = value.view(-1, self.num_kv_heads, self.head_size_v)
+
+        # Legacy AI-SSD sparse KV hook for non-SPARSE_SSD backends only.
+        # When SPARSE_SSD is selected as the real attention backend, Q-aware
+        # selection/load is performed inside SparseSSDAttentionImpl.forward().
+        if self.attn_backend.get_name() != "SPARSE_SSD":
+            try:
+                forward_context = get_forward_context()
+                attn_metadata_for_sparse = getattr(forward_context, "attn_metadata", None)
+                if attn_metadata_for_sparse is not None:
+                    _maybe_sparse_select_kv_layer(
+                        self.layer_name,
+                        query,
+                        key,
+                        value,
+                        self.kv_cache,
+                        attn_metadata_for_sparse,
+                        self,
+                    )
+            except Exception:
+                logger.exception(
+                    "[sparse-kv-hook] Attention.forward sparse hook failed; falling back"
+                )
+
         kv_cache_dummy_dep = None
         if self.use_direct_call:
             # Skip this if sharing KV cache with an earlier attention layer.
@@ -498,6 +733,27 @@ class Attention(nn.Module, AttentionLayerBase):
                 kv_cache_dummy_dep = unified_kv_cache_update(
                     key, value, self.layer_name
                 )
+            try:
+                forward_context = get_forward_context()
+                attn_metadata_for_sparse = getattr(forward_context, "attn_metadata", None)
+            except Exception:
+                attn_metadata_for_sparse = None
+            if (
+                self.attn_backend.get_name() != "SPARSE_SSD"
+                and attn_metadata_for_sparse is not None
+                and _maybe_run_sparse_attention(
+                    self.layer_name,
+                    self,
+                    query,
+                    key,
+                    value,
+                    self.kv_cache,
+                    attn_metadata_for_sparse,
+                    output,
+                )
+            ):
+                return output.view(-1, hidden_size)
+
             unified_attention_with_output(
                 query,
                 key,
@@ -518,6 +774,27 @@ class Attention(nn.Module, AttentionLayerBase):
                 kv_cache_dummy_dep = torch.ops.vllm.unified_kv_cache_update(
                     key, value, encoded
                 )
+            try:
+                forward_context = get_forward_context()
+                attn_metadata_for_sparse = getattr(forward_context, "attn_metadata", None)
+            except Exception:
+                attn_metadata_for_sparse = None
+            if (
+                self.attn_backend.get_name() != "SPARSE_SSD"
+                and attn_metadata_for_sparse is not None
+                and _maybe_run_sparse_attention(
+                    self.layer_name,
+                    self,
+                    query,
+                    key,
+                    value,
+                    self.kv_cache,
+                    attn_metadata_for_sparse,
+                    output,
+                )
+            ):
+                return output.view(-1, hidden_size)
+
             torch.ops.vllm.unified_attention_with_output(
                 query,
                 key,
@@ -730,6 +1007,132 @@ direct_register_custom_op(
 )
 
 
+def _maybe_sparse_select_kv_layer(
+    layer_name: str,
+    query: torch.Tensor,
+    key: torch.Tensor | None,
+    value: torch.Tensor | None,
+    kv_cache: torch.Tensor,
+    attn_metadata: AttentionMetadata,
+    attention_layer: "Attention",
+) -> None:
+    """Invoke an optional LMCache q-aware sparse KV hook.
+
+    This is deliberately best-effort and no-op by default. The connector decides
+    whether sparse KV is enabled. Any selector result is stored on
+    attn_metadata.sparse_selector_result for a future sparse attention backend.
+    """
+    hook_layers = getattr(attn_metadata, "_sparse_kv_hook_layers", None)
+    if hook_layers is None:
+        hook_layers = set()
+        try:
+            setattr(attn_metadata, "_sparse_kv_hook_layers", hook_layers)
+        except Exception:
+            hook_layers = set()
+    if layer_name in hook_layers:
+        return
+
+    try:
+        forward_context = get_forward_context()
+    except Exception:
+        forward_context = None
+
+    connector = None
+
+    # Preferred path for LMCache: the worker connector registers itself in
+    # lmcache.integration.vllm.vllm_v1_adapter. This avoids relying on vLLM
+    # ForwardContext internals, which vary by version and compile path.
+    try:
+        from lmcache.integration.vllm.vllm_v1_adapter import (
+            get_sparse_kv_connector,
+        )
+
+        connector = get_sparse_kv_connector()
+    except Exception:
+        connector = None
+    if connector is None and forward_context is not None:
+        for attr in (
+            "kv_connector",
+            "kv_connector_instance",
+            "kv_connector_worker",
+            "kv_transfer_connector",
+            "connector",
+        ):
+            candidate = getattr(forward_context, attr, None)
+            if candidate is not None and hasattr(candidate, "sparse_select_kv_layer"):
+                connector = candidate
+                break
+
+    # Some vLLM versions keep the connector in nested worker/model-runner
+    # objects. Probe these without assuming a specific public API.
+    if connector is None and forward_context is not None:
+        for parent_attr in ("model_runner", "worker", "runner"):
+            parent = getattr(forward_context, parent_attr, None)
+            if parent is None:
+                continue
+            for attr in ("kv_connector", "connector", "kv_transfer_connector"):
+                candidate = getattr(parent, attr, None)
+                if candidate is not None and hasattr(candidate, "sparse_select_kv_layer"):
+                    connector = candidate
+                    break
+            if connector is not None:
+                break
+
+    if connector is None:
+        global _SPARSE_KV_NO_CONNECTOR_LOGGED
+        if not _SPARSE_KV_NO_CONNECTOR_LOGGED:
+            logger.warning(
+                "[sparse-kv-hook] no connector found for layer=%s; sparse hook inactive",
+                layer_name,
+            )
+            _SPARSE_KV_NO_CONNECTOR_LOGGED = True
+        return
+
+    logger.info(
+        "[sparse-kv-hook] enter layer=%s q_shape=%s connector=%s",
+        layer_name,
+        tuple(query.shape),
+        connector.__class__.__name__,
+    )
+
+    try:
+        result = connector.sparse_select_kv_layer(
+            layer_name=layer_name,
+            query=query,
+            attn_metadata=attn_metadata,
+            key=key,
+            value=value,
+            kv_cache=kv_cache,
+            attention_layer=attention_layer,
+        )
+    except Exception:
+        logger.exception("Sparse KV selector hook failed; falling back to full attention")
+        return
+
+    if result is None:
+        # Do not mark this layer as handled when the selector returns None.
+        # During CUDA-graph warmup or before connector metadata is bound,
+        # sparse_select_kv_layer() legitimately returns None. Marking the
+        # layer here would make the real request skip sparse selection later
+        # because of the hook_layers de-dup check above.
+        logger.debug(
+            "[sparse-kv-hook] selector returned None for layer=%s; "
+            "not marking layer as handled",
+            layer_name,
+        )
+        return
+
+    # Only de-duplicate after a real selector result has been produced and
+    # attached to attn_metadata. This prevents warmup/no-metadata attempts
+    # from suppressing the real request path.
+    hook_layers.add(layer_name)
+    try:
+        setattr(attn_metadata, "sparse_kv_enabled", True)
+        setattr(attn_metadata, "sparse_selector_result", result)
+    except Exception:
+        logger.debug("Unable to attach sparse selector result to attn_metadata")
+
+
 @maybe_transfer_kv_layer
 def unified_attention_with_output(
     query: torch.Tensor,
@@ -747,6 +1150,25 @@ def unified_attention_with_output(
     del kv_cache_dummy_dep
     layer_name = _resolve_layer_name(layer_name)
     attn_metadata, self, kv_cache, _ = get_attention_context(layer_name)
+
+    if self.attn_backend.get_name() != "SPARSE_SSD":
+        _maybe_sparse_select_kv_layer(
+            layer_name, query, key, value, kv_cache, attn_metadata, self
+        )
+
+        if _maybe_run_sparse_attention(
+            layer_name,
+            self,
+            query,
+            key,
+            value,
+            kv_cache,
+            attn_metadata,
+            output,
+            output_scale=output_scale,
+            output_block_scale=output_block_scale,
+        ):
+            return
 
     self.impl.forward(
         self,

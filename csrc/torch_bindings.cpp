@@ -62,6 +62,16 @@ TORCH_LIBRARY_EXPAND(TORCH_EXTENSION_NAME, ops) {
       "    int blocksparse_head_sliding_step) -> ()");
   ops.impl("paged_attention_v2", torch::kCUDA, &paged_attention_v2);
 
+  // Sparse SSD selected-load attention. The CUDA implementation is registered
+  // in csrc/attention/sparse_ssd_attention.cu via TORCH_LIBRARY_IMPL.
+  ops.def(
+      "sparse_ssd_attention(Tensor(a!) out, Tensor query, Tensor kv_cache, "
+      "Tensor active_reqs, Tensor req_token_lens, Tensor req_vllm_cached_tokens, "
+      "Tensor req_lmcache_cached_tokens, Tensor req_slot_lens, "
+      "Tensor slot_mapping_table, Tensor selected_block_table, "
+      "Tensor selected_block_lens, Tensor selected_ready_flags, "
+      "int block_size, int chunk_size, int top_n_chunks, float scale) -> ()");
+
   // Activation ops (quantized only — basic ops moved to _C_stable_libtorch)
   ops.def(
       "silu_and_mul_quant(Tensor! result, Tensor input, Tensor scale) -> ()");

@@ -289,6 +289,22 @@ class KVConnectorBase_V1(ABC):
         """
         return
 
+    def sparse_select_kv_layer(
+        self,
+        layer_name: str,
+        query: torch.Tensor,
+        attn_metadata: AttentionMetadata,
+        **kwargs: Any,
+    ) -> Any | None:
+        """Optional q-aware sparse KV selection hook.
+
+        Connectors that implement sparse KV cache can override this method.
+        It is intentionally non-abstract so existing connectors are not affected.
+        The hook is called after q has been materialized in the attention layer
+        and before the normal attention backend runs.
+        """
+        return None
+
     @abstractmethod
     def start_load_kv(self, forward_context: "ForwardContext", **kwargs: Any) -> None:
         """

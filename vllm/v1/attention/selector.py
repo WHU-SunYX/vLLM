@@ -9,6 +9,7 @@ import torch
 import vllm.envs as envs
 from vllm.config.cache import CacheDType
 from vllm.logger import init_logger
+from vllm.platforms import current_platform
 from vllm.utils.import_utils import resolve_obj_by_qualname
 from vllm.v1.attention.backend import AttentionBackend, AttentionType
 from vllm.v1.attention.backends.registry import (
@@ -16,6 +17,50 @@ from vllm.v1.attention.backends.registry import (
 )
 
 logger = init_logger(__name__)
+
+
+def _as_bool(value, default: bool = False) -> bool:
+    if value is None:
+        return default
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, (int, float)):
+        return bool(value)
+    if isinstance(value, str):
+        return value.strip().lower() in {"1", "true", "yes", "on", "y"}
+    return bool(value)
+
+
+def _sparse_ssd_attention_requested(vllm_config) -> bool:
+    """Return true when LMCache sparse SSD attention should own the backend.
+
+    This runs during Attention construction, before LMCache worker services are
+    fully initialized, so the reliable source is vLLM's kv_connector_extra_config
+    plus an explicit environment override.
+    """
+    env_value = getattr(envs, "LMCACHE_ENABLE_SPARSE_ATTENTION", None)
+    # vllm.envs may not expose the custom env var; read os.environ lazily.
+    if env_value is None:
+        import os
+
+        env_value = os.environ.get("LMCACHE_ENABLE_SPARSE_ATTENTION")
+    if env_value is not None:
+        return _as_bool(env_value, False)
+
+    kv_cfg = getattr(vllm_config, "kv_transfer_config", None)
+    if kv_cfg is None:
+        return False
+    kv_extra = getattr(kv_cfg, "kv_connector_extra_config", None) or {}
+    for key in (
+        "lmcache.enable_sparse_attention",
+        "enable_sparse_attention",
+        "lmcache.sparse_attention",
+        "sparse_attention",
+    ):
+        if key in kv_extra:
+            return _as_bool(kv_extra.get(key), False)
+    return False
+
 
 
 class AttentionSelectorConfig(NamedTuple):
@@ -94,6 +139,37 @@ def get_attn_backend(
         use_non_causal=vllm_config.attention_config.use_non_causal,
         use_batch_invariant=envs.VLLM_BATCH_INVARIANT,
     )
+
+    if _sparse_ssd_attention_requested(vllm_config):
+        from vllm.v1.attention.backends.sparse_ssd_attn import (
+            SparseSSDAttentionBackend,
+        )
+
+        invalid_reasons = SparseSSDAttentionBackend.validate_configuration(
+            head_size=attn_selector_config.head_size,
+            dtype=attn_selector_config.dtype,
+            kv_cache_dtype=attn_selector_config.kv_cache_dtype,
+            block_size=attn_selector_config.block_size,
+            use_mla=attn_selector_config.use_mla,
+            has_sink=attn_selector_config.has_sink,
+            use_sparse=False,
+            use_mm_prefix=attn_selector_config.use_mm_prefix,
+            use_per_head_quant_scales=attn_selector_config.use_per_head_quant_scales,
+            device_capability=current_platform.get_device_capability(),
+            attn_type=attn_selector_config.attn_type,
+            use_non_causal=attn_selector_config.use_non_causal,
+            use_batch_invariant=attn_selector_config.use_batch_invariant,
+        )
+        if invalid_reasons:
+            logger.warning(
+                "SPARSE_SSD attention requested but unsupported for %s: %s; "
+                "falling back to platform backend",
+                attn_selector_config,
+                ", ".join(invalid_reasons),
+            )
+        else:
+            logger.info("Using SPARSE_SSD attention backend due to LMCache sparse attention config")
+            return SparseSSDAttentionBackend
 
     return _cached_get_attn_backend(
         backend=vllm_config.attention_config.backend,
