@@ -81,6 +81,7 @@ TORCH_LIBRARY_EXPAND(TORCH_EXTENSION_NAME, ops) {
       "Tensor req_lmcache_cached_tokens, Tensor req_slot_lens, "
       "Tensor slot_mapping_table, Tensor selected_block_table, "
       "Tensor selected_block_lens, Tensor selected_ready_flags, "
+      "Tensor debug_counters, "
       "int block_size, int chunk_size, int top_n_chunks, float scale) -> ()");
 
 

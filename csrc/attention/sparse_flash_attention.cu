@@ -26,6 +26,14 @@ constexpr int kSparseFlashThreads = 128;
 // and maintain one online-softmax accumulator per output dimension.
 static_assert(kSparseFlashThreads == 128);
 
+__device__ inline void debug_atomic_add(int64_t* counters, int idx, unsigned long long val) {
+  atomicAdd(reinterpret_cast<unsigned long long*>(&counters[idx]), val);
+}
+
+__device__ inline void debug_atomic_max(int64_t* counters, int idx, unsigned long long val) {
+  atomicMax(reinterpret_cast<unsigned long long*>(&counters[idx]), val);
+}
+
 template <typename T>
 __device__ inline float to_float(T v) {
   return static_cast<float>(v);
@@ -113,6 +121,8 @@ __global__ void sparse_flash_attention_kernel(
     const int32_t* __restrict__ selected_block_table,
     const int32_t* __restrict__ selected_block_lens,
     const int32_t* __restrict__ selected_ready_flags,
+    int64_t* __restrict__ debug_counters,
+    int debug_enabled,
     int64_t q_s0,
     int64_t q_s1,
     int64_t q_s2,
@@ -147,7 +157,24 @@ __global__ void sparse_flash_attention_kernel(
   const int ready = valid_req ? selected_ready_flags[req] : 0;
   const int selected_len = valid_req ? selected_block_lens[req] : 0;
 
+  if (debug_enabled && tid == 0) {
+    // debug_counters layout, accumulated per op call after Python zero_():
+    // [0] launched query-head blocks
+    // [1] active query-head blocks that will visit selected KV blocks
+    // [2] selected block visits, accumulated across query-head blocks
+    // [3] selected KV token visits, accumulated across query-head blocks
+    // [4] inactive/empty query-head blocks
+    // [5] invalid selected block entries encountered
+    // [6] max active_reqs value observed inside the CUDA kernel
+    // [7] max selected_block_lens value observed inside the CUDA kernel
+    debug_atomic_add(debug_counters, 0, 1ULL);
+    debug_atomic_max(debug_counters, 6, static_cast<unsigned long long>(max(active, 0)));
+  }
+
   if (!valid_req || ready == 0 || selected_len <= 0) {
+    if (debug_enabled && tid == 0) {
+      debug_atomic_add(debug_counters, 4, 1ULL);
+    }
     for (int d = tid; d < head_dim; d += blockDim.x) {
       out[static_cast<int64_t>(q_token) * out_s0 +
           static_cast<int64_t>(q_head) * out_s1 +
@@ -176,9 +203,22 @@ __global__ void sparse_flash_attention_kernel(
 
   const int bounded_selected_len = min(selected_len, max_selected_blocks);
 
+  if (debug_enabled && tid == 0) {
+    debug_atomic_add(debug_counters, 1, 1ULL);
+    debug_atomic_add(debug_counters, 2, static_cast<unsigned long long>(bounded_selected_len));
+    debug_atomic_add(debug_counters, 3,
+                     static_cast<unsigned long long>(bounded_selected_len) *
+                         static_cast<unsigned long long>(block_size));
+    debug_atomic_max(debug_counters, 7,
+                     static_cast<unsigned long long>(max(bounded_selected_len, 0)));
+  }
+
   for (int bi = 0; bi < bounded_selected_len; ++bi) {
     const int block_id = selected_block_table[req * max_selected_blocks + bi];
     if (block_id < 0) {
+      if (debug_enabled && tid == 0) {
+        debug_atomic_add(debug_counters, 5, 1ULL);
+      }
       continue;
     }
 
@@ -249,6 +289,7 @@ void sparse_flash_attention(
     const at::Tensor& selected_block_table,
     const at::Tensor& selected_block_lens,
     const at::Tensor& selected_ready_flags,
+    const at::Tensor& debug_counters,
     int64_t block_size,
     int64_t chunk_size,
     int64_t top_n_chunks,
@@ -268,6 +309,14 @@ void sparse_flash_attention(
   TORCH_CHECK(selected_block_table.is_cuda(), "sparse_flash_attention: selected_block_table must be CUDA");
   TORCH_CHECK(selected_block_lens.is_cuda(), "sparse_flash_attention: selected_block_lens must be CUDA");
   TORCH_CHECK(selected_ready_flags.is_cuda(), "sparse_flash_attention: selected_ready_flags must be CUDA");
+  const bool debug_enabled = debug_counters.defined() && debug_counters.numel() >= 8;
+  if (debug_enabled) {
+    TORCH_CHECK(debug_counters.is_cuda(), "sparse_flash_attention: debug_counters must be CUDA when provided");
+    TORCH_CHECK(debug_counters.scalar_type() == at::ScalarType::Long,
+                "sparse_flash_attention: debug_counters must be int64/torch.long");
+    TORCH_CHECK(debug_counters.is_contiguous(),
+                "sparse_flash_attention: debug_counters must be contiguous");
+  }
   TORCH_CHECK(query.dim() == 3, "sparse_flash_attention: query must be [tokens, heads, head_dim]");
   TORCH_CHECK(out.dim() == 3, "sparse_flash_attention: out must be [tokens, heads, head_dim]");
   TORCH_CHECK(kv_cache.dim() == 5, "sparse_flash_attention: kv_cache must be 5-D");
@@ -337,6 +386,8 @@ void sparse_flash_attention(
             selected_block_table.data_ptr<int32_t>(),
             selected_block_lens.data_ptr<int32_t>(),
             selected_ready_flags.data_ptr<int32_t>(),
+            debug_enabled ? debug_counters.data_ptr<int64_t>() : nullptr,
+            debug_enabled ? 1 : 0,
             query.stride(0),
             query.stride(1),
             query.stride(2),

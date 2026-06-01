@@ -18,6 +18,7 @@ void sparse_flash_attention(
     const at::Tensor& selected_block_table,
     const at::Tensor& selected_block_lens,
     const at::Tensor& selected_ready_flags,
+    const at::Tensor& debug_counters,
     int64_t block_size,
     int64_t chunk_size,
     int64_t top_n_chunks,
