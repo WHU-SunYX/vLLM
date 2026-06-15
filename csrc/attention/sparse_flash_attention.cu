@@ -16,6 +16,13 @@
 #include <cfloat>
 #include <cmath>
 #include <cstdint>
+#include <cstring>
+#include <cstdlib>
+#include <dlfcn.h>
+#include <mutex>
+#include <stdexcept>
+#include <string>
+#include <vector>
 
 namespace {
 
@@ -411,6 +418,462 @@ void sparse_flash_attention(
 }
 
 
+namespace {
+
+constexpr uint32_t AISSD_SPARSE_KV_PROTOCOL_VERSION = 2u;
+constexpr uint32_t AISSD_SPARSE_KV_FLAG_Q_INLINE_CMB = (1u << 0);
+constexpr uint32_t AISSD_SPARSE_KV_FLAG_NATIVE_EXTENTS = (1u << 1);
+constexpr uint32_t AISSD_SPARSE_KV_FLAG_RESULT_INLINE_CMB = (1u << 2);
+constexpr int32_t CMD_SPARSE_KV_RUN_MANIFEST_LBA = 100;
+constexpr uint32_t AISSD_MAX_DIMS = 8;
+constexpr uint32_t AISSD_MAX_CANDIDATES = 256;
+constexpr uint32_t AISSD_MAX_EXTENTS_PER_CANDIDATE = 64;
+constexpr uint32_t AISSD_MAX_SELECTED_CHUNKS = 256;
+constexpr uint32_t AISSD_MAX_SELECTED_BLOCKS = 4096;
+
+#pragma pack(push, 1)
+struct AissdSparseKvExtent {
+  uint64_t lba;
+  uint64_t bytes;
+};
+
+struct AissdSparseKvCandidate {
+  uint32_t chunk_index;
+  uint32_t token_start;
+  uint32_t token_end;
+  uint32_t num_tokens;
+  uint32_t dtype;
+  uint32_t fmt;
+  uint32_t ndim;
+  uint32_t shape[AISSD_MAX_DIMS];
+  uint64_t file_offset;
+  uint64_t nbytes;
+  uint32_t extent_count;
+  uint32_t reserved0;
+  AissdSparseKvExtent extents[AISSD_MAX_EXTENTS_PER_CANDIDATE];
+};
+
+struct AissdSparseKvRunReq {
+  int32_t cmd;
+  uint32_t version;
+  uint64_t job_id;
+  uint64_t request_id;
+  uint32_t layer_id;
+  uint32_t backend;
+  uint32_t num_q_heads;
+  uint32_t num_kv_heads;
+  uint32_t head_dim;
+  uint32_t chunk_size;
+  uint32_t block_size;
+  uint32_t top_n_chunks;
+  uint32_t top_m;
+  uint32_t score_mode;
+  uint32_t q_dtype;
+  uint32_t kv_dtype;
+  uint32_t q_token_count;
+  uint32_t candidate_chunk_count;
+  uint64_t q_cmb_offset;
+  uint32_t q_bytes;
+  uint32_t manifest_block_size;
+  uint32_t flags;
+  uint32_t reserved1;
+  AissdSparseKvCandidate candidates[AISSD_MAX_CANDIDATES];
+};
+
+struct AissdSparseKvRunResp {
+  int32_t status;
+  uint32_t version;
+  uint64_t job_id;
+  uint64_t request_id;
+  uint32_t layer_id;
+  uint32_t backend;
+  uint32_t selected_chunk_count;
+  uint32_t selected_block_count;
+  uint32_t block_size;
+  uint32_t chunk_size;
+  uint32_t error_code;
+  uint32_t reserved0;
+  uint32_t selected_chunk_ids[AISSD_MAX_SELECTED_CHUNKS];
+  float selected_chunk_scores[AISSD_MAX_SELECTED_CHUNKS];
+  uint32_t selected_block_ids[AISSD_MAX_SELECTED_BLOCKS];
+};
+#pragma pack(pop)
+
+using AissdRunNativeExtentsFn = int (*)(const void*, uint32_t,
+                                        const AissdSparseKvRunReq*,
+                                        AissdSparseKvRunResp*, int);
+using AissdRpcInitFn = int (*)();
+
+struct AissdClientApi {
+  void* handle = nullptr;
+  AissdRunNativeExtentsFn run = nullptr;
+};
+
+AissdClientApi& get_aissd_client() {
+  static AissdClientApi api;
+  static std::once_flag once;
+  std::call_once(once, []() {
+    const char* lib = std::getenv("AISSD_SPARSE_KV_LIB");
+    if (lib == nullptr || std::strlen(lib) == 0) {
+      lib = "libaissd_sparse_kv_client.so";
+    }
+    api.handle = dlopen(lib, RTLD_NOW | RTLD_LOCAL);
+    if (!api.handle) {
+      throw std::runtime_error(std::string("dlopen AISSD_SPARSE_KV_LIB failed: ") + dlerror());
+    }
+    auto init = reinterpret_cast<AissdRpcInitFn>(dlsym(api.handle, "aissd_sparse_kv_rpc_init"));
+    api.run = reinterpret_cast<AissdRunNativeExtentsFn>(dlsym(api.handle, "aissd_sparse_kv_run_native_extents"));
+    if (!api.run) {
+      throw std::runtime_error("dlsym aissd_sparse_kv_run_native_extents failed");
+    }
+    if (init) {
+      const int rc = init();
+      if (rc != 0) {
+        throw std::runtime_error("aissd_sparse_kv_rpc_init failed rc=" + std::to_string(rc));
+      }
+    }
+  });
+  return api;
+}
+
+inline void aissd_check_cuda(cudaError_t err, const char* what) {
+  if (err != cudaSuccess) {
+    throw std::runtime_error(std::string(what) + ": " + cudaGetErrorString(err));
+  }
+}
+
+inline int64_t aissd_elem_i64_cpu(const at::Tensor& t, int64_t i) {
+  TORCH_CHECK(!t.is_cuda(), "AISSD metadata tensor must be CPU after materialization");
+  if (t.scalar_type() == at::kInt) return static_cast<int64_t>(t.data_ptr<int32_t>()[i]);
+  if (t.scalar_type() == at::kLong) return t.data_ptr<int64_t>()[i];
+  TORCH_CHECK(false, "AISSD metadata tensor must be int32/int64");
+}
+
+inline int64_t aissd_elem2_i64_cpu(const at::Tensor& t, int64_t i, int64_t j) {
+  return aissd_elem_i64_cpu(t, i * t.size(1) + j);
+}
+
+inline uint64_t aissd_elem3_u64_cpu(const at::Tensor& t, int64_t a, int64_t b, int64_t c) {
+  const int64_t idx = (a * t.size(1) + b) * t.size(2) + c;
+  TORCH_CHECK(!t.is_cuda() && t.scalar_type() == at::kLong,
+              "AISSD extent/shape tensor must be CPU int64");
+  return static_cast<uint64_t>(t.data_ptr<int64_t>()[idx]);
+}
+
+uint32_t aissd_query_dtype_code(const at::Tensor& q) {
+  if (q.scalar_type() == at::kFloat) return 1;
+  if (q.scalar_type() == at::kHalf) return 2;
+  if (q.scalar_type() == at::kBFloat16) return 3;
+  if (q.scalar_type() == at::kChar) return 4;
+  TORCH_CHECK(false, "AISSD selector unsupported query dtype");
+}
+
+uint64_t aissd_job_id(int64_t layer_id, int64_t req_index) {
+  return (static_cast<uint64_t>(layer_id) << 32) ^ static_cast<uint64_t>(req_index + 1);
+}
+
+int64_t aissd_query_tail_tokens() {
+  const char* v = std::getenv("AISSD_SPARSE_KV_QUERY_TAIL_TOKENS");
+  if (!v || !v[0]) {
+    return 1;
+  }
+  const long n = std::strtol(v, nullptr, 10);
+  return n > 0 ? static_cast<int64_t>(n) : 1;
+}
+
+int64_t aissd_select_query_token_index(const at::Tensor& query,
+                                       const at::Tensor& req_token_lens_cpu,
+                                       int64_t req_index,
+                                       int64_t reqs) {
+  if (query.dim() < 3) {
+    return 0;
+  }
+  const int64_t q_tokens = query.size(0);
+  TORCH_CHECK(q_tokens > 0, "aissd_sparse_kv_select: empty query tensor");
+
+  const int64_t tail_tokens = aissd_query_tail_tokens();
+  TORCH_CHECK(tail_tokens == 1,
+              "aissd_sparse_kv_select currently supports AISSD_SPARSE_KV_QUERY_TAIL_TOKENS=1, got ",
+              tail_tokens);
+
+  // Decode/common path: one query row per active request.
+  if (q_tokens == reqs) {
+    return req_index;
+  }
+
+  // Single active request with a prefill/chunked-prefill query batch.  Use the
+  // last query row only; the SSD selector/NPU qK model is a decode-style
+  // single-token selector.
+  if (reqs == 1) {
+    return q_tokens - 1;
+  }
+
+  // If req_token_lens describes the current query rows, use the last row of
+  // each request span.
+  int64_t total = 0;
+  for (int64_t r = 0; r < reqs; ++r) {
+    total += std::max<int64_t>(aissd_elem_i64_cpu(req_token_lens_cpu, r), 0);
+  }
+  if (total == q_tokens) {
+    int64_t base = 0;
+    for (int64_t r = 0; r < req_index; ++r) {
+      base += std::max<int64_t>(aissd_elem_i64_cpu(req_token_lens_cpu, r), 0);
+    }
+    const int64_t len = std::max<int64_t>(aissd_elem_i64_cpu(req_token_lens_cpu, req_index), 1);
+    return std::min<int64_t>(base + len - 1, q_tokens - 1);
+  }
+
+  // Conservative fallback for unusual batching metadata: select the last
+  // available query token instead of copying the full prefill query tensor into
+  // the CMB raw area.
+  return q_tokens - 1;
+}
+
+at::Tensor aissd_make_single_query_for_req(const at::Tensor& query,
+                                           const at::Tensor& req_token_lens_cpu,
+                                           int64_t req_index,
+                                           int64_t reqs) {
+  TORCH_CHECK(query.dim() == 2 || query.dim() == 3,
+              "aissd_sparse_kv_select: expected query shape [H,D] or [T,H,D], got dim=",
+              query.dim());
+  at::Tensor q_one;
+  if (query.dim() == 2) {
+    q_one = query;
+  } else {
+    const int64_t token_index = aissd_select_query_token_index(query, req_token_lens_cpu, req_index, reqs);
+    q_one = query.select(0, token_index);
+  }
+  return q_one.contiguous();
+}
+
+void ensure_not_cuda_graph_capturing(cudaStream_t stream) {
+  cudaStreamCaptureStatus status = cudaStreamCaptureStatusNone;
+  const cudaError_t rc = cudaStreamIsCapturing(stream, &status);
+  if (rc == cudaSuccess && status != cudaStreamCaptureStatusNone) {
+    throw std::runtime_error(
+        "aissd_sparse_kv_select performs HOST<->SSD RPC and must run outside CUDA graph capture. "
+        "Split/exclude this op from vLLM CUDA graph capture; keep sparse_flash_attention itself graph-captured.");
+  }
+}
+
+}  // namespace
+
+void aissd_sparse_kv_select(
+    const at::Tensor& query,
+    const at::Tensor& active_reqs,
+    const at::Tensor& req_token_lens,
+    const at::Tensor& req_lmcache_cached_tokens,
+    const at::Tensor& aissd_candidate_count,
+    const at::Tensor& aissd_candidate_chunk_ids,
+    const at::Tensor& aissd_candidate_block_ids,
+    const at::Tensor& aissd_candidate_block_lens,
+    const at::Tensor& aissd_candidate_token_start,
+    const at::Tensor& aissd_candidate_token_end,
+    const at::Tensor& aissd_candidate_dtype,
+    const at::Tensor& aissd_candidate_fmt,
+    const at::Tensor& aissd_candidate_ndim,
+    const at::Tensor& aissd_candidate_shape,
+    const at::Tensor& aissd_candidate_extent_count,
+    const at::Tensor& aissd_candidate_extent_lba,
+    const at::Tensor& aissd_candidate_extent_bytes,
+    at::Tensor& selected_block_table,
+    at::Tensor& selected_block_lens,
+    at::Tensor& selected_ready_flags,
+    at::Tensor& fa_block_table,
+    at::Tensor& fa_seq_lens,
+    int64_t layer_id,
+    int64_t backend,
+    int64_t num_q_heads,
+    int64_t num_kv_heads,
+    int64_t head_dim,
+    int64_t chunk_size,
+    int64_t block_size,
+    int64_t top_n_chunks,
+    int64_t top_m,
+    int64_t score_mode,
+    int64_t manifest_block_size,
+    int64_t timeout_ms) {
+  TORCH_CHECK(query.is_cuda(), "aissd_sparse_kv_select: query must be CUDA");
+  TORCH_CHECK(selected_block_table.is_cuda() && selected_block_lens.is_cuda() &&
+                  selected_ready_flags.is_cuda() && fa_block_table.is_cuda() && fa_seq_lens.is_cuda(),
+              "aissd_sparse_kv_select: output metadata tensors must be CUDA");
+  TORCH_CHECK(selected_block_table.scalar_type() == at::kInt && selected_block_lens.scalar_type() == at::kInt &&
+                  selected_ready_flags.scalar_type() == at::kInt && fa_block_table.scalar_type() == at::kInt &&
+                  fa_seq_lens.scalar_type() == at::kInt,
+              "aissd_sparse_kv_select: selected/fa metadata tensors must be int32");
+  TORCH_CHECK(selected_block_table.dim() == 2 && fa_block_table.dim() == 2 &&
+                  selected_block_table.size(0) == fa_block_table.size(0) &&
+                  selected_block_table.size(1) == fa_block_table.size(1),
+              "aissd_sparse_kv_select: fa_block_table shape must match selected_block_table");
+  TORCH_CHECK(selected_block_lens.numel() == fa_seq_lens.numel(),
+              "aissd_sparse_kv_select: fa_seq_lens length must match selected_block_lens");
+
+  const c10::cuda::CUDAGuard guard(query.device());
+  cudaStream_t stream = at::cuda::getCurrentCUDAStream();
+  ensure_not_cuda_graph_capturing(stream);
+
+  auto active_cpu = active_reqs.cpu();
+  const int64_t reqs = aissd_elem_i64_cpu(active_cpu, 0);
+  if (reqs <= 0 || backend == 0) {
+    return;
+  }
+  TORCH_CHECK(reqs <= selected_block_table.size(0),
+              "aissd_sparse_kv_select: active_reqs exceeds metadata rows");
+
+  // Materialize CPU metadata. LMCache normally prepares these on CPU; .cpu()
+  // also keeps the call robust if a future path publishes pinned/CUDA tensors.
+  auto req_lens_cpu = req_token_lens.cpu();
+  auto cand_count_cpu = aissd_candidate_count.cpu();
+  auto chunk_ids_cpu = aissd_candidate_chunk_ids.cpu();
+  auto block_ids_cpu = aissd_candidate_block_ids.cpu();
+  auto block_lens_cpu = aissd_candidate_block_lens.cpu();
+  auto tok_start_cpu = aissd_candidate_token_start.cpu();
+  auto tok_end_cpu = aissd_candidate_token_end.cpu();
+  auto dtype_cpu = aissd_candidate_dtype.cpu();
+  auto fmt_cpu = aissd_candidate_fmt.cpu();
+  auto ndim_cpu = aissd_candidate_ndim.cpu();
+  auto shape_cpu = aissd_candidate_shape.cpu();
+  auto ext_count_cpu = aissd_candidate_extent_count.cpu();
+  auto ext_lba_cpu = aissd_candidate_extent_lba.cpu();
+  auto ext_bytes_cpu = aissd_candidate_extent_bytes.cpu();
+
+  AissdClientApi& api = get_aissd_client();
+  const int64_t max_blocks = selected_block_table.size(1);
+  std::vector<int32_t> out_table(selected_block_table.numel(), -1);
+  std::vector<int32_t> out_lens(selected_block_lens.numel(), 0);
+  std::vector<int32_t> out_ready(selected_ready_flags.numel(), 0);
+  std::vector<int32_t> out_fa_table(fa_block_table.numel(), 0);
+  std::vector<int32_t> out_fa_lens(fa_seq_lens.numel(), 1);
+
+  for (int64_t r = 0; r < reqs; ++r) {
+    const int64_t cand_n = aissd_elem_i64_cpu(cand_count_cpu, r);
+    TORCH_CHECK(cand_n > 0, "aissd_sparse_kv_select: candidate_count is zero");
+    TORCH_CHECK(cand_n <= AISSD_MAX_CANDIDATES,
+                "aissd_sparse_kv_select: candidate_count exceeds protocol max");
+
+    at::Tensor q_one = aissd_make_single_query_for_req(query, req_lens_cpu, r, reqs);
+    TORCH_CHECK(q_one.dim() == 2 && q_one.size(0) == num_q_heads && q_one.size(1) == head_dim,
+                "aissd_sparse_kv_select: selected q tail shape mismatch, got ",
+                q_one.sizes(), " expected [", num_q_heads, ",", head_dim, "]");
+    const int64_t q_bytes_i64 = q_one.numel() * q_one.element_size();
+    TORCH_CHECK(q_bytes_i64 > 0 && q_bytes_i64 <= UINT32_MAX,
+                "aissd_sparse_kv_select: invalid single-token q_bytes=", q_bytes_i64);
+    std::vector<uint8_t> q_host(static_cast<size_t>(q_bytes_i64));
+    aissd_check_cuda(cudaMemcpyAsync(q_host.data(), q_one.data_ptr(), q_bytes_i64,
+                                     cudaMemcpyDeviceToHost, stream),
+                     "aissd_sparse_kv_select: copy q tail D2H");
+    aissd_check_cuda(cudaStreamSynchronize(stream),
+                     "aissd_sparse_kv_select: sync q tail D2H");
+    const uint32_t q_dtype = aissd_query_dtype_code(q_one);
+    const uint32_t q_bytes = static_cast<uint32_t>(q_bytes_i64);
+
+    AissdSparseKvRunReq req{};
+    AissdSparseKvRunResp resp{};
+    req.cmd = CMD_SPARSE_KV_RUN_MANIFEST_LBA;
+    req.version = AISSD_SPARSE_KV_PROTOCOL_VERSION;
+    req.job_id = aissd_job_id(layer_id, r);
+    req.request_id = static_cast<uint64_t>(r + 1);
+    req.layer_id = static_cast<uint32_t>(layer_id);
+    req.backend = static_cast<uint32_t>(backend);
+    req.num_q_heads = static_cast<uint32_t>(num_q_heads);
+    req.num_kv_heads = static_cast<uint32_t>(num_kv_heads);
+    req.head_dim = static_cast<uint32_t>(head_dim);
+    req.chunk_size = static_cast<uint32_t>(chunk_size);
+    req.block_size = static_cast<uint32_t>(block_size);
+    req.top_n_chunks = static_cast<uint32_t>(top_n_chunks);
+    req.top_m = static_cast<uint32_t>(top_m);
+    req.score_mode = static_cast<uint32_t>(score_mode);
+    req.q_dtype = q_dtype;
+    req.kv_dtype = static_cast<uint32_t>(aissd_elem2_i64_cpu(dtype_cpu, r, 0));
+    req.q_token_count = 1;
+    req.candidate_chunk_count = static_cast<uint32_t>(cand_n);
+    req.q_bytes = static_cast<uint32_t>(q_bytes);
+    req.manifest_block_size = static_cast<uint32_t>(manifest_block_size);
+    req.flags = AISSD_SPARSE_KV_FLAG_Q_INLINE_CMB |
+                AISSD_SPARSE_KV_FLAG_NATIVE_EXTENTS |
+                AISSD_SPARSE_KV_FLAG_RESULT_INLINE_CMB;
+
+    for (int64_t c = 0; c < cand_n; ++c) {
+      auto& dst = req.candidates[c];
+      dst.chunk_index = static_cast<uint32_t>(aissd_elem2_i64_cpu(chunk_ids_cpu, r, c));
+      dst.token_start = static_cast<uint32_t>(aissd_elem2_i64_cpu(tok_start_cpu, r, c));
+      dst.token_end = static_cast<uint32_t>(aissd_elem2_i64_cpu(tok_end_cpu, r, c));
+      dst.num_tokens = dst.token_end > dst.token_start
+                           ? dst.token_end - dst.token_start
+                           : static_cast<uint32_t>(chunk_size);
+      dst.dtype = static_cast<uint32_t>(aissd_elem2_i64_cpu(dtype_cpu, r, c));
+      dst.fmt = static_cast<uint32_t>(aissd_elem2_i64_cpu(fmt_cpu, r, c));
+      dst.ndim = static_cast<uint32_t>(aissd_elem2_i64_cpu(ndim_cpu, r, c));
+      for (uint32_t d = 0; d < AISSD_MAX_DIMS; ++d) {
+        dst.shape[d] = static_cast<uint32_t>(aissd_elem3_u64_cpu(shape_cpu, r, c, d));
+      }
+      const int64_t extent_n = aissd_elem2_i64_cpu(ext_count_cpu, r, c);
+      TORCH_CHECK(extent_n > 0 && extent_n <= AISSD_MAX_EXTENTS_PER_CANDIDATE,
+                  "aissd_sparse_kv_select: invalid candidate extent_count");
+      dst.extent_count = static_cast<uint32_t>(extent_n);
+      uint64_t nbytes = 0;
+      for (int64_t e = 0; e < extent_n; ++e) {
+        dst.extents[e].lba = aissd_elem3_u64_cpu(ext_lba_cpu, r, c, e);
+        dst.extents[e].bytes = aissd_elem3_u64_cpu(ext_bytes_cpu, r, c, e);
+        nbytes += dst.extents[e].bytes;
+      }
+      dst.nbytes = nbytes;
+    }
+
+    const int rc = api.run(q_host.data(), static_cast<uint32_t>(q_bytes), &req, &resp,
+                           static_cast<int>(timeout_ms));
+    TORCH_CHECK(rc == 0 && resp.status == 0,
+                "aissd_sparse_kv_run_native_extents failed rc=", rc,
+                " status=", resp.status, " error_code=", resp.error_code);
+
+    int64_t out_len = 0;
+    for (uint32_t si = 0; si < resp.selected_chunk_count && out_len < max_blocks; ++si) {
+      const uint32_t chunk_id = resp.selected_chunk_ids[si];
+      for (int64_t c = 0; c < cand_n && out_len < max_blocks; ++c) {
+        if (static_cast<uint32_t>(aissd_elem2_i64_cpu(chunk_ids_cpu, r, c)) != chunk_id) continue;
+        const int64_t blen = aissd_elem2_i64_cpu(block_lens_cpu, r, c);
+        for (int64_t b = 0; b < blen && out_len < max_blocks; ++b) {
+          const int64_t idx = (r * aissd_candidate_block_ids.size(1) + c) *
+                              aissd_candidate_block_ids.size(2) + b;
+          const int32_t block_id = block_ids_cpu.data_ptr<int32_t>()[idx];
+          if (block_id >= 0) {
+            out_table[r * max_blocks + out_len] = block_id;
+            out_fa_table[r * max_blocks + out_len] = block_id;
+            ++out_len;
+          }
+        }
+      }
+    }
+    TORCH_CHECK(out_len > 0, "aissd_sparse_kv_select: SSD selected zero KV blocks");
+    out_lens[r] = static_cast<int32_t>(out_len);
+    out_ready[r] = 1;
+    out_fa_lens[r] = static_cast<int32_t>(out_len * block_size);
+  }
+
+  aissd_check_cuda(cudaMemcpyAsync(selected_block_table.data_ptr(), out_table.data(),
+                                   selected_block_table.numel() * sizeof(int32_t),
+                                   cudaMemcpyHostToDevice, stream),
+                   "aissd_sparse_kv_select: copy selected_block_table H2D");
+  aissd_check_cuda(cudaMemcpyAsync(selected_block_lens.data_ptr(), out_lens.data(),
+                                   selected_block_lens.numel() * sizeof(int32_t),
+                                   cudaMemcpyHostToDevice, stream),
+                   "aissd_sparse_kv_select: copy selected_block_lens H2D");
+  aissd_check_cuda(cudaMemcpyAsync(selected_ready_flags.data_ptr(), out_ready.data(),
+                                   selected_ready_flags.numel() * sizeof(int32_t),
+                                   cudaMemcpyHostToDevice, stream),
+                   "aissd_sparse_kv_select: copy selected_ready_flags H2D");
+  aissd_check_cuda(cudaMemcpyAsync(fa_block_table.data_ptr(), out_fa_table.data(),
+                                   fa_block_table.numel() * sizeof(int32_t),
+                                   cudaMemcpyHostToDevice, stream),
+                   "aissd_sparse_kv_select: copy fa_block_table H2D");
+  aissd_check_cuda(cudaMemcpyAsync(fa_seq_lens.data_ptr(), out_fa_lens.data(),
+                                   fa_seq_lens.numel() * sizeof(int32_t),
+                                   cudaMemcpyHostToDevice, stream),
+                   "aissd_sparse_kv_select: copy fa_seq_lens H2D");
+}
+
+
 TORCH_LIBRARY_IMPL(_C, CUDA, m) {
   m.impl("sparse_flash_attention", &sparse_flash_attention);
+  m.impl("aissd_sparse_kv_select", &aissd_sparse_kv_select);
 }

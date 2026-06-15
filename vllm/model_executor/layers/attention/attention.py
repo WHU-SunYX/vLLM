@@ -185,82 +185,14 @@ def _maybe_run_sparse_attention(
     output_scale: torch.Tensor | None = None,
     output_block_scale: torch.Tensor | None = None,
 ) -> bool:
-    """Run sparse attention when explicitly enabled and metadata is present.
+    """Disabled by native-extents v5.
 
-    Returns True when sparse attention wrote `output`, otherwise False so the
-    caller can fall back to the original attention backend.
+    The production sparse path must be selected by vLLM's SPARSE_SSD attention
+    backend and the graph-visible step context prepared by LMCacheConnector.
+    Do not trigger Q-aware sparse selection from Attention.forward Python hooks:
+    CUDA graph replay does not re-enter this Python code for every real request.
     """
-    global _SPARSE_ATTENTION_DISABLED_LOGGED
-
-    if not _sparse_attention_enabled():
-        if not _SPARSE_ATTENTION_DISABLED_LOGGED:
-            logger.info(
-                "[sparse-attn] disabled at runtime. Set "
-                "LMCACHE_ENABLE_SPARSE_ATTENTION=1 or "
-                "kv_connector_extra_config['lmcache.enable_sparse_attention']=true "
-                "to route sparse metadata to SparseSSDAttentionImpl."
-            )
-            _SPARSE_ATTENTION_DISABLED_LOGGED = True
-        return False
-
-    if not getattr(attn_metadata, "sparse_kv_enabled", False):
-        logger.debug(
-            "[sparse-attn] enabled but no sparse metadata for layer=%s; "
-            "falling back to full attention",
-            layer_name,
-        )
-        return False
-
-    sparse_block_table = getattr(attn_metadata, "sparse_block_table_tensor", None)
-    sparse_block_lens = getattr(attn_metadata, "sparse_block_lens", None)
-    if sparse_block_table is None or sparse_block_lens is None:
-        logger.warning(
-            "[sparse-attn] enabled but sparse block metadata is missing for "
-            "layer=%s; falling back to full attention",
-            layer_name,
-        )
-        return False
-
-    impl = _get_sparse_attention_impl()
-    if impl is None:
-        return False
-
-    try:
-        total_blocks = int(sparse_block_lens.sum().item())
-    except Exception:
-        total_blocks = -1
-    logger.info(
-        "[sparse-attn] route layer=%s q_shape=%s selected_reqs=%s "
-        "selected_blocks=%d impl=%s",
-        layer_name,
-        tuple(query.shape),
-        tuple(sparse_block_table.shape) if hasattr(sparse_block_table, "shape") else None,
-        total_blocks,
-        impl.__class__.__name__,
-    )
-
-    try:
-        impl.forward(
-            attention_layer,
-            query,
-            key,
-            value,
-            kv_cache,
-            attn_metadata,
-            output=output,
-            output_scale=output_scale,
-            output_block_scale=output_block_scale,
-            scale=getattr(attention_layer.impl, "scale", None),
-        )
-        return True
-    except Exception:
-        logger.exception(
-            "[sparse-attn] SparseSSDAttentionImpl failed for layer=%s; "
-            "falling back to full attention",
-            layer_name,
-        )
-        return False
-
+    return False
 
 
 def validate_kv_sharing_target(
@@ -1016,121 +948,49 @@ def _maybe_sparse_select_kv_layer(
     attn_metadata: AttentionMetadata,
     attention_layer: "Attention",
 ) -> None:
-    """Invoke an optional LMCache q-aware sparse KV hook.
+    """Disabled by native-extents v5.
 
-    This is deliberately best-effort and no-op by default. The connector decides
-    whether sparse KV is enabled. Any selector result is stored on
-    attn_metadata.sparse_selector_result for a future sparse attention backend.
+    Q-aware selection must not be performed from the legacy Python hook.
+    The SPARSE_SSD backend consumes LMCache's persistent sparse step context.
     """
-    hook_layers = getattr(attn_metadata, "_sparse_kv_hook_layers", None)
-    if hook_layers is None:
-        hook_layers = set()
-        try:
-            setattr(attn_metadata, "_sparse_kv_hook_layers", hook_layers)
-        except Exception:
-            hook_layers = set()
-    if layer_name in hook_layers:
-        return
+    return
 
+
+def _maybe_run_aissd_selector_external(
+    layer_name: str,
+    query: torch.Tensor,
+    attn_metadata: AttentionMetadata,
+    attention_layer: "Attention",
+) -> None:
+    """Run AISSD q-aware selector from vLLM's attention splitting op.
+
+    ``unified_attention_with_output`` is already in vLLM's splitting_ops.  Calling
+    the AISSD selector here keeps host RPC/CMB/SSD IO out of CUDA graph capture
+    while still exposing the real per-layer Q tensor.  The sparse backend forward
+    then consumes the stable selected-block tensors populated by this helper.
+    """
     try:
-        forward_context = get_forward_context()
-    except Exception:
-        forward_context = None
-
-    connector = None
-
-    # Preferred path for LMCache: the worker connector registers itself in
-    # lmcache.integration.vllm.vllm_v1_adapter. This avoids relying on vLLM
-    # ForwardContext internals, which vary by version and compile path.
-    try:
-        from lmcache.integration.vllm.vllm_v1_adapter import (
-            get_sparse_kv_connector,
+        module = __import__(
+            "vllm.v1.attention.backends.sparse_ssd_attn",
+            fromlist=["maybe_run_aissd_selector_external"],
         )
-
-        connector = get_sparse_kv_connector()
-    except Exception:
-        connector = None
-    if connector is None and forward_context is not None:
-        for attr in (
-            "kv_connector",
-            "kv_connector_instance",
-            "kv_connector_worker",
-            "kv_transfer_connector",
-            "connector",
-        ):
-            candidate = getattr(forward_context, attr, None)
-            if candidate is not None and hasattr(candidate, "sparse_select_kv_layer"):
-                connector = candidate
-                break
-
-    # Some vLLM versions keep the connector in nested worker/model-runner
-    # objects. Probe these without assuming a specific public API.
-    if connector is None and forward_context is not None:
-        for parent_attr in ("model_runner", "worker", "runner"):
-            parent = getattr(forward_context, parent_attr, None)
-            if parent is None:
-                continue
-            for attr in ("kv_connector", "connector", "kv_transfer_connector"):
-                candidate = getattr(parent, attr, None)
-                if candidate is not None and hasattr(candidate, "sparse_select_kv_layer"):
-                    connector = candidate
-                    break
-            if connector is not None:
-                break
-
-    if connector is None:
-        global _SPARSE_KV_NO_CONNECTOR_LOGGED
-        if not _SPARSE_KV_NO_CONNECTOR_LOGGED:
-            logger.warning(
-                "[sparse-kv-hook] no connector found for layer=%s; sparse hook inactive",
-                layer_name,
-            )
-            _SPARSE_KV_NO_CONNECTOR_LOGGED = True
-        return
-
-    logger.info(
-        "[sparse-kv-hook] enter layer=%s q_shape=%s connector=%s",
-        layer_name,
-        tuple(query.shape),
-        connector.__class__.__name__,
-    )
-
-    try:
-        result = connector.sparse_select_kv_layer(
-            layer_name=layer_name,
+        runner = getattr(module, "maybe_run_aissd_selector_external", None)
+        if not callable(runner):
+            return
+        runner(
             query=query,
             attn_metadata=attn_metadata,
-            key=key,
-            value=value,
-            kv_cache=kv_cache,
-            attention_layer=attention_layer,
+            layer_name=layer_name,
+            head_size=int(getattr(attention_layer, "head_size")),
+            num_heads=int(getattr(attention_layer, "num_heads")),
+            num_kv_heads=int(getattr(attention_layer, "num_kv_heads")),
         )
     except Exception:
-        logger.exception("Sparse KV selector hook failed; falling back to full attention")
-        return
-
-    if result is None:
-        # Do not mark this layer as handled when the selector returns None.
-        # During CUDA-graph warmup or before connector metadata is bound,
-        # sparse_select_kv_layer() legitimately returns None. Marking the
-        # layer here would make the real request skip sparse selection later
-        # because of the hook_layers de-dup check above.
-        logger.debug(
-            "[sparse-kv-hook] selector returned None for layer=%s; "
-            "not marking layer as handled",
+        logger.exception(
+            "[aissd-selector-op] external selector failed for layer=%s",
             layer_name,
         )
-        return
-
-    # Only de-duplicate after a real selector result has been produced and
-    # attached to attn_metadata. This prevents warmup/no-metadata attempts
-    # from suppressing the real request path.
-    hook_layers.add(layer_name)
-    try:
-        setattr(attn_metadata, "sparse_kv_enabled", True)
-        setattr(attn_metadata, "sparse_selector_result", result)
-    except Exception:
-        logger.debug("Unable to attach sparse selector result to attn_metadata")
+        raise
 
 
 @maybe_transfer_kv_layer
@@ -1169,6 +1029,13 @@ def unified_attention_with_output(
             output_block_scale=output_block_scale,
         ):
             return
+    else:
+        _maybe_run_aissd_selector_external(
+            layer_name=layer_name,
+            query=query,
+            attn_metadata=attn_metadata,
+            attention_layer=self,
+        )
 
     self.impl.forward(
         self,

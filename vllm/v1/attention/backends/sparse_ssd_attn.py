@@ -2,6 +2,7 @@
 """AI-SSD sparse attention backend for vLLM V1.
 
 This backend is wired into vLLM's normal attention backend selection path.
+NO_PYTHON_ATTENTION_HOOK: runtime sparse attention must be driven by the step context prepared by LMCacheConnector.start_load_kv()/prepare_sparse_kv_step(), not by Attention.forward Python hooks.
 For production, it must not perform Python-side Q-aware selection or GDS IO
 inside ``forward``: CUDA graph replay will not re-enter Python for every real
 request.  Instead, LMCache prepares a step-level sparse KV context in
@@ -16,6 +17,7 @@ mode where full KV remains available.
 from typing import Any
 import copy
 import os
+import time
 
 import torch
 
@@ -64,13 +66,200 @@ def _sparse_attention_impl() -> str:
     # custom: current self-written sparse_flash_attention CUDA op.
     # fa_varlen: experimental path that treats selected blocks as a compacted
     # FlashAttention paged block_table and reuses flash_attn_varlen_func.
-    return str(os.environ.get("VLLM_SPARSE_ATTENTION_IMPL", "custom")).lower()
+    return str(os.environ.get("VLLM_SPARSE_ATTENTION_IMPL", "fa_varlen")).lower()
 
 
 def _sparse_fa_replay_debug_enabled() -> bool:
     # Lightweight CUDA-graph replay marker for FA-varlen sparse attention.
     # Disabled by default because draining the device marker synchronizes.
     return _env_flag("VLLM_SPARSE_FA_REPLAY_DEBUG", "0")
+
+
+def _sparse_attention_diag_enabled() -> bool:
+    return _env_flag("VLLM_SPARSE_ATTENTION_DIAG", "0")
+
+
+def _aissd_selector_stats_enabled() -> bool:
+    return _env_flag("AISSD_SPARSE_KV_SELECTOR_STATS", "0")
+
+
+def _aissd_layer_reuse_enabled() -> bool:
+    # Current production bring-up policy: run q-aware AISSD selector once per
+    # decode step/generation and reuse selected chunks across all layers.
+    # Disable with AISSD_SPARSE_KV_LAYER_REUSE=0 for exact per-layer selection.
+    return _env_flag("AISSD_SPARSE_KV_LAYER_REUSE", "1")
+
+
+def _aissd_backend_code(name: Any) -> int:
+    value = str(name or "host").lower()
+    if value == "ssd-cpu":
+        return 1
+    if value == "ssd-npu":
+        return 2
+    return 0
+
+
+def _maybe_run_aissd_selector_op(
+    query: torch.Tensor,
+    step_context: dict[str, Any],
+    layer_name: str,
+    head_size: int,
+    num_heads: int,
+    num_kv_heads: int,
+) -> None:
+    """Run AISSD q-aware selector before sparse FlashAttention.
+
+    This is not the old Attention.forward Python hook.  The C++ op is invoked
+    from the sparse attention backend and consumes the real Q tensor plus the
+    native LMCache candidate extent metadata prepared in the step context.
+    The C++ implementation is registered from sparse_flash_attention.cu, so it
+    reuses the existing sparse attention custom-op build path.
+    """
+    backend_name = step_context.get("aissd_selector_backend", "host")
+    backend = _aissd_backend_code(backend_name)
+    if backend == 0:
+        return
+
+    # CUDA graph capture / warmup can reach this backend before a real
+    # SchedulerOutput has published candidate native extents.  Do not run AISSD
+    # RPC here: the selector is meaningful only for real steps with active
+    # requests and candidate extents.  This is not a runtime fallback; it is a
+    # bootstrap/capture guard.
+    try:
+        host_active_reqs = int(step_context.get("host_active_reqs", 0) or 0)
+    except Exception:
+        host_active_reqs = 0
+    if host_active_reqs <= 0:
+        if _sparse_kv_debug_enabled() and not torch.cuda.is_current_stream_capturing():
+            logger.info(
+                "[aissd-selector-op] skip bootstrap/capture layer=%s backend=%s "
+                "host_active_reqs=%s",
+                layer_name,
+                backend_name,
+                step_context.get("host_active_reqs"),
+            )
+        return
+    if torch.cuda.is_current_stream_capturing():
+        # This should normally only happen during CUDA graph capture with dummy
+        # inputs.  Host RPC/CMB/SSD IO is not CUDA-graph-capturable, so never
+        # issue AISSD RPC while a stream capture is active.
+        if _sparse_kv_debug_enabled():
+            logger.info(
+                "[aissd-selector-op] skip CUDA graph capture layer=%s backend=%s",
+                layer_name,
+                backend_name,
+            )
+        return
+
+    generation = int(step_context.get("context_generation", -1) or -1)
+    if _aissd_layer_reuse_enabled():
+        done_generation = int(step_context.get("aissd_selector_done_generation", -999999) or -999999)
+        if done_generation == generation:
+            if _aissd_selector_stats_enabled() or _sparse_kv_debug_enabled():
+                logger.info(
+                    "[aissd-selector-op] reuse layer=%s generation=%s first_layer=%s",
+                    layer_name,
+                    generation,
+                    step_context.get("aissd_selector_done_layer"),
+                )
+            return
+
+    required = (
+        "aissd_candidate_count",
+        "aissd_candidate_chunk_ids",
+        "aissd_candidate_block_ids",
+        "aissd_candidate_block_lens",
+        "aissd_candidate_token_start",
+        "aissd_candidate_token_end",
+        "aissd_candidate_dtype",
+        "aissd_candidate_fmt",
+        "aissd_candidate_ndim",
+        "aissd_candidate_shape",
+        "aissd_candidate_extent_count",
+        "aissd_candidate_extent_lba",
+        "aissd_candidate_extent_bytes",
+        "fa_block_table",
+        "fa_seq_lens",
+    )
+    missing = [k for k in required if k not in step_context]
+    if missing:
+        raise RuntimeError(
+            f"AISSD selector backend={backend_name} requested for layer={layer_name}, "
+            f"and host_active_reqs={host_active_reqs}, but sparse step context "
+            f"lacks native extent tensors: {missing}. This indicates "
+            "prepare_sparse_kv_step() did not publish AISSD candidate extents "
+            "for a real request."
+        )
+    layer_id = int(step_context.get("current_layer_id", -1))
+    if layer_id < 0:
+        try:
+            import re
+            m = re.search(r"layers\.(\d+)", str(layer_name))
+            layer_id = int(m.group(1)) if m else 0
+        except Exception:
+            layer_id = 0
+    if _sparse_kv_debug_enabled() and not torch.cuda.is_current_stream_capturing():
+        logger.info(
+            "[aissd-selector-op] layer=%s backend=%s q_shape=%s active_reqs=%s",
+            layer_name,
+            backend_name,
+            tuple(query.shape),
+            step_context.get("host_active_reqs"),
+        )
+    t0 = time.perf_counter()
+    vllm_ops.aissd_sparse_kv_select(
+        query,
+        step_context["active_reqs"],
+        step_context["req_token_lens"],
+        step_context["req_lmcache_cached_tokens"],
+        step_context["aissd_candidate_count"],
+        step_context["aissd_candidate_chunk_ids"],
+        step_context["aissd_candidate_block_ids"],
+        step_context["aissd_candidate_block_lens"],
+        step_context["aissd_candidate_token_start"],
+        step_context["aissd_candidate_token_end"],
+        step_context["aissd_candidate_dtype"],
+        step_context["aissd_candidate_fmt"],
+        step_context["aissd_candidate_ndim"],
+        step_context["aissd_candidate_shape"],
+        step_context["aissd_candidate_extent_count"],
+        step_context["aissd_candidate_extent_lba"],
+        step_context["aissd_candidate_extent_bytes"],
+        step_context["selected_block_table"],
+        step_context["selected_block_lens"],
+        step_context["selected_ready_flags"],
+        step_context["fa_block_table"],
+        step_context["fa_seq_lens"],
+        layer_id,
+        backend,
+        int(num_heads),
+        int(num_kv_heads),
+        int(head_size),
+        int(step_context["chunk_size"]),
+        int(step_context["block_size"]),
+        int(step_context["top_n_chunks"]),
+        int(step_context.get("aissd_top_m", 8)),
+        int(step_context.get("aissd_score_mode_code", 1)),
+        int(step_context.get("aissd_manifest_block_size", 4096)),
+        int(step_context.get("aissd_timeout_ms", 300000)),
+    )
+    elapsed_ms = (time.perf_counter() - t0) * 1000.0
+    step_context["aissd_selector_done_generation"] = generation
+    step_context["aissd_selector_done_layer"] = str(layer_name)
+    step_context["aissd_selector_done_layer_id"] = int(layer_id)
+    if _aissd_selector_stats_enabled():
+        logger.info(
+            "[aissd-selector-latency] layer=%s generation=%s backend=%s "
+            "elapsed_ms=%.3f active_reqs=%s candidates=%s top_n=%s reuse_layers=%s",
+            layer_name,
+            generation,
+            backend_name,
+            elapsed_ms,
+            step_context.get("host_active_reqs"),
+            step_context.get("aissd_candidate_count"),
+            step_context.get("top_n_chunks"),
+            _aissd_layer_reuse_enabled(),
+        )
 
 
 def _ensure_sparse_debug_counters(
@@ -666,6 +855,14 @@ class SparseSSDAttentionImpl(AttentionImpl[AttentionMetadata]):
                 )
             _log_sparse_context_ptr("attn-before-op", layer_name, step_context)
             try:
+                _maybe_run_aissd_selector_op(
+                    query=query,
+                    step_context=step_context,
+                    layer_name=layer_name,
+                    head_size=int(self.head_size),
+                    num_heads=int(self.num_heads),
+                    num_kv_heads=int(self.num_kv_heads),
+                )
                 impl = _sparse_attention_impl()
                 if impl in ("fa_varlen", "flash", "flash_attn", "flashattention"):
                     return self._forward_sparse_fa_varlen(
@@ -762,9 +959,24 @@ class SparseSSDAttentionImpl(AttentionImpl[AttentionMetadata]):
                 if self._should_raise_on_missing_sparse():
                     raise
 
+        connector = _get_sparse_connector()
+        reason_parts = []
+        if step_context is None:
+            reason_parts.append("no_sparse_step_context")
+        if connector is None:
+            reason_parts.append("no_registered_lmcache_connector")
+        else:
+            spec = getattr(connector, "sparse_kv_spec", None)
+            reason_parts.append(f"connector={type(connector).__name__}")
+            reason_parts.append(f"spec_enabled={getattr(spec, 'enabled', None)}")
+            reason_parts.append(f"disable_full_load={getattr(spec, 'disable_full_load', None)}")
+            getter = getattr(connector, "get_sparse_kv_step_context", None)
+            reason_parts.append(f"has_context_getter={callable(getter)}")
+        reason = ",".join(reason_parts) if reason_parts else "unknown"
         message = (
             f"[sparse-attn] production sparse context/custom op unavailable "
-            f"for layer={layer_name}"
+            f"for layer={layer_name}; reason={reason}; "
+            f"impl={_sparse_attention_impl()}"
         )
         if self._should_raise_on_missing_sparse():
             raise RuntimeError(
@@ -772,7 +984,10 @@ class SparseSSDAttentionImpl(AttentionImpl[AttentionMetadata]):
                 + "; refusing FlashAttention fallback because "
                 + "lmcache.enable_sparse_attention is enabled"
             )
-        logger.warning_once(message + "; falling back to FlashAttention")
+        if _sparse_attention_diag_enabled():
+            logger.warning(message + "; falling back to FlashAttention")
+        else:
+            logger.warning_once(message + "; falling back to FlashAttention")
         return self._fallback_forward(
             layer,
             query,

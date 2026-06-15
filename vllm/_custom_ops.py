@@ -3942,6 +3942,90 @@ def sparse_flash_attention(
         scale,
     )
 
+
+# AI-SSD q-aware selector bridge. This reuses the sparse_flash_attention custom
+# op build unit on the C++ side; it is intentionally separate from the old
+# Python Attention.forward hook.
+def aissd_sparse_kv_select(
+    query: torch.Tensor,
+    active_reqs: torch.Tensor,
+    req_token_lens: torch.Tensor,
+    req_lmcache_cached_tokens: torch.Tensor,
+    aissd_candidate_count: torch.Tensor,
+    aissd_candidate_chunk_ids: torch.Tensor,
+    aissd_candidate_block_ids: torch.Tensor,
+    aissd_candidate_block_lens: torch.Tensor,
+    aissd_candidate_token_start: torch.Tensor,
+    aissd_candidate_token_end: torch.Tensor,
+    aissd_candidate_dtype: torch.Tensor,
+    aissd_candidate_fmt: torch.Tensor,
+    aissd_candidate_ndim: torch.Tensor,
+    aissd_candidate_shape: torch.Tensor,
+    aissd_candidate_extent_count: torch.Tensor,
+    aissd_candidate_extent_lba: torch.Tensor,
+    aissd_candidate_extent_bytes: torch.Tensor,
+    selected_block_table: torch.Tensor,
+    selected_block_lens: torch.Tensor,
+    selected_ready_flags: torch.Tensor,
+    fa_block_table: torch.Tensor,
+    fa_seq_lens: torch.Tensor,
+    layer_id: int,
+    backend: int,
+    num_q_heads: int,
+    num_kv_heads: int,
+    head_dim: int,
+    chunk_size: int,
+    block_size: int,
+    top_n_chunks: int,
+    top_m: int,
+    score_mode: int,
+    manifest_block_size: int,
+    timeout_ms: int,
+) -> None:
+    op = getattr(torch.ops._C, "aissd_sparse_kv_select", None)
+    if op is None:
+        raise RuntimeError(
+            "torch.ops._C.aissd_sparse_kv_select is not registered. "
+            "Rebuild vLLM with the updated sparse_flash_attention custom op before "
+            "setting lmcache.sparse_kv_backend=ssd-cpu/ssd-npu."
+        )
+    op(
+        query,
+        active_reqs,
+        req_token_lens,
+        req_lmcache_cached_tokens,
+        aissd_candidate_count,
+        aissd_candidate_chunk_ids,
+        aissd_candidate_block_ids,
+        aissd_candidate_block_lens,
+        aissd_candidate_token_start,
+        aissd_candidate_token_end,
+        aissd_candidate_dtype,
+        aissd_candidate_fmt,
+        aissd_candidate_ndim,
+        aissd_candidate_shape,
+        aissd_candidate_extent_count,
+        aissd_candidate_extent_lba,
+        aissd_candidate_extent_bytes,
+        selected_block_table,
+        selected_block_lens,
+        selected_ready_flags,
+        fa_block_table,
+        fa_seq_lens,
+        layer_id,
+        backend,
+        num_q_heads,
+        num_kv_heads,
+        head_dim,
+        chunk_size,
+        block_size,
+        top_n_chunks,
+        top_m,
+        score_mode,
+        manifest_block_size,
+        timeout_ms,
+    )
+
 # AI-SSD sparse attention op wrapper.
 def sparse_ssd_attention(
     out: torch.Tensor,
