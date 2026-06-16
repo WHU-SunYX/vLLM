@@ -19,6 +19,7 @@ instead of embedding feature-specific logic directly.
 
 import functools
 import gc
+import os
 import time
 from copy import deepcopy
 from typing import Any, NamedTuple
@@ -105,6 +106,42 @@ from vllm.v1.worker.gpu.structured_outputs import StructuredOutputsWorker
 from vllm.v1.worker.lora_model_runner_mixin import LoRAModelRunnerMixin
 
 logger = init_logger(__name__)
+
+def _aissd_sparse_kv_step_eager_enabled(vllm_config: VllmConfig) -> tuple[bool, str]:
+    """Return whether real AISSD sparse-KV steps should skip CUDA graph replay.
+
+    This is intentionally a per-step dispatch decision, not a global mutation of
+    compilation_config. Capture/warmup can stay enabled; only real steps that
+    need the HOST/SSD selector are dispatched with CUDAGraphMode.NONE so the
+    Python/C++ bridge is re-entered with the real Q tensor.
+    """
+    if os.environ.get("AISSD_SPARSE_KV_ALLOW_CUDAGRAPH", "0").lower() in (
+        "1", "true", "yes", "on"
+    ):
+        return False, "allow_cudagraph_override"
+    if os.environ.get("AISSD_SPARSE_KV_STEP_EAGER", "1").lower() in (
+        "0", "false", "no", "off"
+    ):
+        return False, "step_eager_disabled"
+
+    kv_transfer_config = getattr(vllm_config, "kv_transfer_config", None)
+    extra_config = getattr(kv_transfer_config, "kv_connector_extra_config", None) or {}
+
+    def _cfg_bool(key: str, default: bool = False) -> bool:
+        val = extra_config.get(key, default)
+        if isinstance(val, bool):
+            return val
+        if isinstance(val, str):
+            return val.lower() in ("1", "true", "yes", "on")
+        return bool(val)
+
+    enabled = _cfg_bool("lmcache.enable_sparse_kv_cache", False)
+    sparse_attn = _cfg_bool("lmcache.enable_sparse_attention", False)
+    backend = str(extra_config.get("lmcache.sparse_kv_backend", "")).lower()
+    if enabled and sparse_attn and backend in ("ssd-cpu", "ssd-npu"):
+        return True, backend
+    return False, "not_aissd_sparse_backend"
+
 
 
 class GPUModelRunner(LoRAModelRunnerMixin):
@@ -393,8 +430,12 @@ class GPUModelRunner(LoRAModelRunnerMixin):
                 ) + spec.num_speculative_blocks
             max_num_blocks_per_group.append(max_num_blocks)
 
-        self.attn_groups, attn_cg_support, kernel_block_sizes = init_attn_backend(
-            self.kv_cache_config, self.vllm_config, self.device
+        # Current vLLM V2 GPU attn_utils.init_attn_backend() returns
+        # exactly four values:
+        #   attn_backends, attn_groups, attn_cg_support, kernel_block_sizes
+        # Keep the full contract instead of guessing/ignoring by type.
+        self.attn_backends, self.attn_groups, attn_cg_support, kernel_block_sizes = (
+            init_attn_backend(self.kv_cache_config, self.vllm_config, self.device)
         )
         self.block_tables = BlockTables(
             block_sizes=block_sizes,
@@ -435,11 +476,18 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             )
 
         self.kv_caches: list[torch.Tensor] = []
+        # Current V2 attn_utils.init_kv_cache() expects the
+        # per-layer attention backend map returned by init_attn_backend().
+        # Contract verified from runtime introspection:
+        #   init_attn_backend() ->
+        #       attn_backends, attn_groups, attn_cg_support, kernel_block_sizes
+        #   init_kv_cache(..., attn_backends, device, cache_dtype,
+        #                 kernel_block_sizes, vllm_config)
         kv_caches_dict = init_kv_cache(
             self.kv_caches,
             self.compilation_config.static_forward_context,
             self.kv_cache_config,
-            self.attn_groups,
+            self.attn_backends,
             self.device,
             self.cache_config.cache_dtype,
             kernel_block_sizes,
@@ -1038,6 +1086,27 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             # cross-attention cache with dynamic encoder outputs.
             skip_compiled = True
 
+        # AISSD sparse selector must run outside CUDA graph replay for real
+        # request steps. Keep global graph capture enabled; only dispatch this
+        # step with CUDAGraphMode.NONE when sparse-KV selector can be active.
+        aissd_step_eager, aissd_step_reason = _aissd_sparse_kv_step_eager_enabled(
+            self.vllm_config
+        )
+        aissd_step_eager = (
+            aissd_step_eager
+            and not dummy_run
+            and not is_profile
+            and num_toks > 0
+        )
+        if aissd_step_eager and not getattr(self, "_aissd_step_eager_logged", False):
+            logger.warning(
+                "[warning][aissd-selector-step-eager] backend=%s "
+                "reason=dispatch this real AISSD step with CUDAGraphMode.NONE; "
+                "global CUDA graph capture remains enabled",
+                aissd_step_reason,
+            )
+            self._aissd_step_eager_logged = True
+
         batch_desc, num_tokens_across_dp = dispatch_cg_and_sync_dp(
             self.cudagraph_manager,
             num_reqs,
@@ -1045,7 +1114,7 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             uniform_tok_count,
             self.dp_size,
             self.dp_rank,
-            need_eager=is_profile or skip_compiled,
+            need_eager=is_profile or skip_compiled or aissd_step_eager,
         )
 
         if batch_desc.num_tokens == 0:
