@@ -79,6 +79,133 @@ def _sparse_attention_diag_enabled() -> bool:
     return _env_flag("VLLM_SPARSE_ATTENTION_DIAG", "0")
 
 
+def _sparse_attention_profile_enabled() -> bool:
+    # High-overhead profiling: uses CUDA events and, by default, synchronizes.
+    # Enable only for profiling runs, not for final throughput measurement.
+    return _env_flag("VLLM_SPARSE_ATTN_PROFILE", "0") or _env_flag(
+        "VLLM_SPARSE_ATTN_TIME", "0"
+    )
+
+
+def _sparse_attention_profile_sync_enabled() -> bool:
+    # CUDA event elapsed_time is only reliable after synchronization.  Keep this
+    # enabled for accurate profiling; disable only if you want enqueue-time logs.
+    return _env_flag("VLLM_SPARSE_ATTN_PROFILE_SYNC", "1")
+
+
+def _sparse_attention_nvtx_enabled() -> bool:
+    return _env_flag("VLLM_SPARSE_ATTN_NVTX", "0")
+
+
+def _sparse_profile_begin(tag: str, layer_name: str, query: Any | None = None) -> dict[str, Any] | None:
+    if not (_sparse_attention_profile_enabled() or _sparse_attention_nvtx_enabled()):
+        return None
+    capturing = False
+    try:
+        capturing = torch.cuda.is_current_stream_capturing()
+    except Exception:
+        capturing = False
+
+    prof: dict[str, Any] = {
+        "tag": tag,
+        "layer_name": layer_name,
+        "cpu_t0": time.perf_counter(),
+        "cuda_start": None,
+        "cuda_end": None,
+        "nvtx": False,
+    }
+    if _sparse_attention_nvtx_enabled():
+        try:
+            torch.cuda.nvtx.range_push(f"aissd:{tag}:{layer_name}")
+            prof["nvtx"] = True
+        except Exception:
+            prof["nvtx"] = False
+
+    if (
+        _sparse_attention_profile_enabled()
+        and not capturing
+        and isinstance(query, torch.Tensor)
+        and query.is_cuda
+        and torch.cuda.is_available()
+    ):
+        try:
+            ev0 = torch.cuda.Event(enable_timing=True)
+            ev1 = torch.cuda.Event(enable_timing=True)
+            ev0.record()
+            prof["cuda_start"] = ev0
+            prof["cuda_end"] = ev1
+        except Exception:
+            prof["cuda_start"] = None
+            prof["cuda_end"] = None
+    return prof
+
+
+def _sparse_profile_end(
+    prof: dict[str, Any] | None,
+    step_context: dict[str, Any] | None,
+    query: Any | None = None,
+    impl: str | None = None,
+    extra: str = "",
+) -> None:
+    if prof is None:
+        return
+    cpu_ms = (time.perf_counter() - float(prof.get("cpu_t0", time.perf_counter()))) * 1000.0
+    cuda_ms: float | None = None
+    ev0 = prof.get("cuda_start")
+    ev1 = prof.get("cuda_end")
+    if ev0 is not None and ev1 is not None:
+        try:
+            ev1.record()
+            if _sparse_attention_profile_sync_enabled():
+                torch.cuda.synchronize()
+                cuda_ms = float(ev0.elapsed_time(ev1))
+        except Exception:
+            cuda_ms = None
+    if prof.get("nvtx"):
+        try:
+            torch.cuda.nvtx.range_pop()
+        except Exception:
+            pass
+    if not _sparse_attention_profile_enabled():
+        return
+
+    q_shape = tuple(query.shape) if isinstance(query, torch.Tensor) else None
+    generation = None if step_context is None else step_context.get("context_generation")
+    host_reqs = None if step_context is None else step_context.get("host_active_reqs")
+    selected_blocks = None if step_context is None else step_context.get("host_selected_blocks")
+    top_n = None if step_context is None else step_context.get("top_n_chunks")
+    chunk_size = None if step_context is None else step_context.get("chunk_size")
+    block_size = None if step_context is None else step_context.get("block_size")
+    candidate_count = None if step_context is None else step_context.get("aissd_candidate_count")
+    if isinstance(candidate_count, torch.Tensor):
+        # Do not read CUDA tensors here; logging a tensor object is enough and avoids extra sync.
+        candidate_count_repr = f"Tensor(shape={tuple(candidate_count.shape)}, device={candidate_count.device})"
+    else:
+        candidate_count_repr = candidate_count
+
+    logger.info(
+        "[sparse-attn-time] tag=%s impl=%s layer=%s generation=%s "
+        "q_shape=%s host_reqs=%s selected_blocks=%s candidate_count=%s "
+        "top_n=%s chunk=%s block=%s cpu_ms=%.3f cuda_ms=%s sync=%s%s%s",
+        prof.get("tag"),
+        impl,
+        prof.get("layer_name"),
+        generation,
+        q_shape,
+        host_reqs,
+        selected_blocks,
+        candidate_count_repr,
+        top_n,
+        chunk_size,
+        block_size,
+        cpu_ms,
+        "NA" if cuda_ms is None else f"{cuda_ms:.3f}",
+        _sparse_attention_profile_sync_enabled(),
+        " " if extra else "",
+        extra,
+    )
+
+
 def _aissd_selector_stats_enabled() -> bool:
     return _env_flag("AISSD_SPARSE_KV_SELECTOR_STATS", "0")
 
@@ -207,6 +334,7 @@ def _maybe_run_aissd_selector_op(
             step_context.get("host_active_reqs"),
         )
     t0 = time.perf_counter()
+    selector_prof = _sparse_profile_begin("aissd_selector_op", layer_name, query)
     vllm_ops.aissd_sparse_kv_select(
         query,
         step_context["active_reqs"],
@@ -243,6 +371,7 @@ def _maybe_run_aissd_selector_op(
         int(step_context.get("aissd_manifest_block_size", 4096)),
         int(step_context.get("aissd_timeout_ms", 300000)),
     )
+    _sparse_profile_end(selector_prof, step_context, query, impl=str(backend_name))
     elapsed_ms = (time.perf_counter() - t0) * 1000.0
     step_context["aissd_selector_done_generation"] = generation
     step_context["aissd_selector_done_layer"] = str(layer_name)
@@ -804,17 +933,28 @@ class SparseSSDAttentionImpl(AttentionImpl[AttentionMetadata]):
 
         self._write_sparse_fa_replay_marker(step_context, q_tokens)
 
-        return self._fallback_impl.forward(
-            layer,
-            query,
-            key,
-            value,
-            kv_cache,
-            sparse_meta,
-            output=output,
-            output_scale=output_scale,
-            output_block_scale=output_block_scale,
-        )
+        fa_prof = _sparse_profile_begin("sparse_attention", layer_name, query)
+        try:
+            result = self._fallback_impl.forward(
+                layer,
+                query,
+                key,
+                value,
+                kv_cache,
+                sparse_meta,
+                output=output,
+                output_scale=output_scale,
+                output_block_scale=output_block_scale,
+            )
+        finally:
+            _sparse_profile_end(
+                fa_prof,
+                step_context,
+                query,
+                impl="fa_varlen",
+                extra=f"fa_max_seq_len={sparse_max_seq_len}",
+            )
+        return result
 
     def forward(
         self,
@@ -855,6 +995,7 @@ class SparseSSDAttentionImpl(AttentionImpl[AttentionMetadata]):
                 )
             _log_sparse_context_ptr("attn-before-op", layer_name, step_context)
             try:
+                sparse_total_prof = _sparse_profile_begin("sparse_forward_total", layer_name, query)
                 _maybe_run_aissd_selector_op(
                     query=query,
                     step_context=step_context,
@@ -865,7 +1006,7 @@ class SparseSSDAttentionImpl(AttentionImpl[AttentionMetadata]):
                 )
                 impl = _sparse_attention_impl()
                 if impl in ("fa_varlen", "flash", "flash_attn", "flashattention"):
-                    return self._forward_sparse_fa_varlen(
+                    result = self._forward_sparse_fa_varlen(
                         layer,
                         query,
                         key,
@@ -878,6 +1019,10 @@ class SparseSSDAttentionImpl(AttentionImpl[AttentionMetadata]):
                         step_context,
                         layer_name,
                     )
+                    _sparse_profile_end(
+                        sparse_total_prof, step_context, query, impl="fa_varlen"
+                    )
+                    return result
                 if impl not in ("custom", "cuda", "sparse_flash"):
                     raise RuntimeError(
                         f"Unknown VLLM_SPARSE_ATTENTION_IMPL={impl!r}; "
@@ -898,6 +1043,7 @@ class SparseSSDAttentionImpl(AttentionImpl[AttentionMetadata]):
                 if debug_enabled:
                     debug_counters.zero_()
 
+                custom_prof = _sparse_profile_begin("sparse_attention", layer_name, query)
                 vllm_ops.sparse_flash_attention(
                     output,
                     query,
@@ -916,6 +1062,9 @@ class SparseSSDAttentionImpl(AttentionImpl[AttentionMetadata]):
                     int(step_context["chunk_size"]),
                     int(step_context["top_n_chunks"]),
                     float(self.scale),
+                )
+                _sparse_profile_end(
+                    custom_prof, step_context, query, impl="custom"
                 )
                 if debug_enabled and not torch.cuda.is_current_stream_capturing():
                     (
@@ -949,6 +1098,9 @@ class SparseSSDAttentionImpl(AttentionImpl[AttentionMetadata]):
                         step_context.get("host_selected_blocks"),
                         step_context.get("context_generation"),
                     )
+                _sparse_profile_end(
+                    sparse_total_prof, step_context, query, impl="custom"
+                )
                 return output
             except Exception:
                 logger.exception(
