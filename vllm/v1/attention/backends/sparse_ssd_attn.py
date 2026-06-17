@@ -801,6 +801,47 @@ class SparseSSDAttentionImpl(AttentionImpl[AttentionMetadata]):
         if isinstance(selected_block_lens, torch.Tensor) and selected_block_lens.numel() > 0:
             marker[7].copy_(selected_block_lens[0].to(dtype=marker.dtype))
 
+    def _can_route_sparse_fa_varlen(
+        self,
+        query: torch.Tensor,
+        step_context: dict[str, Any],
+    ) -> tuple[bool, str]:
+        """Return whether this step is safe to run through sparse FA-varlen.
+
+        FA-varlen sparse metadata is sized for decode-like sparse steps whose
+        number of query rows equals the number of active requests.  Prefill and
+        chunked-prefill can have thousands of query rows while no AISSD selector
+        result is available yet; those steps must use the normal dense
+        FlashAttention fallback.  This guard is intentionally placed before the
+        AISSD selector op, so prefill/warmup does not issue HOST<->SSD RPC.
+        """
+        q_tokens = int(query.shape[0])
+        try:
+            host_active_reqs = int(step_context.get("host_active_reqs", 0) or 0)
+        except Exception:
+            host_active_reqs = 0
+        if host_active_reqs <= 0:
+            return False, f"no_active_sparse_requests(host_active_reqs={host_active_reqs})"
+
+        fa_block_table = step_context.get("fa_block_table")
+        fa_query_start_loc = step_context.get("fa_query_start_loc")
+        if not isinstance(fa_block_table, torch.Tensor):
+            return False, "missing_fa_block_table"
+        if not isinstance(fa_query_start_loc, torch.Tensor):
+            return False, "missing_fa_query_start_loc"
+
+        block_rows = int(fa_block_table.shape[0]) if fa_block_table.dim() >= 1 else 0
+        qstart_rows = int(fa_query_start_loc.shape[0]) if fa_query_start_loc.dim() >= 1 else 0
+        if q_tokens + 1 > qstart_rows or q_tokens > block_rows:
+            return (
+                False,
+                "metadata_capacity_prefill_or_large_batch("
+                f"q_tokens={q_tokens}, block_table_rows={tuple(fa_block_table.shape)}, "
+                f"query_start_loc={tuple(fa_query_start_loc.shape)}"
+                ")",
+            )
+        return True, "ok"
+
     def _forward_sparse_fa_varlen(
         self,
         layer: AttentionLayer,
@@ -995,6 +1036,37 @@ class SparseSSDAttentionImpl(AttentionImpl[AttentionMetadata]):
                 )
             _log_sparse_context_ptr("attn-before-op", layer_name, step_context)
             try:
+                impl = _sparse_attention_impl()
+                if impl in ("fa_varlen", "flash", "flash_attn", "flashattention"):
+                    can_route_fa, skip_reason = self._can_route_sparse_fa_varlen(
+                        query, step_context
+                    )
+                    if not can_route_fa:
+                        if (
+                            _sparse_attention_diag_enabled()
+                            or _sparse_kv_debug_enabled()
+                        ) and not torch.cuda.is_current_stream_capturing():
+                            logger.info(
+                                "[sparse-attn-fa] skip sparse FA-varlen route "
+                                "layer=%s q_shape=%s generation=%s reason=%s; "
+                                "falling back to FlashAttention",
+                                layer_name,
+                                tuple(query.shape),
+                                step_context.get("context_generation"),
+                                skip_reason,
+                            )
+                        return self._fallback_forward(
+                            layer,
+                            query,
+                            key,
+                            value,
+                            kv_cache,
+                            attn_metadata,
+                            output,
+                            output_scale,
+                            output_block_scale,
+                        )
+
                 sparse_total_prof = _sparse_profile_begin("sparse_forward_total", layer_name, query)
                 _maybe_run_aissd_selector_op(
                     query=query,
@@ -1004,7 +1076,6 @@ class SparseSSDAttentionImpl(AttentionImpl[AttentionMetadata]):
                     num_heads=int(self.num_heads),
                     num_kv_heads=int(self.num_kv_heads),
                 )
-                impl = _sparse_attention_impl()
                 if impl in ("fa_varlen", "flash", "flash_attn", "flashattention"):
                     result = self._forward_sparse_fa_varlen(
                         layer,
