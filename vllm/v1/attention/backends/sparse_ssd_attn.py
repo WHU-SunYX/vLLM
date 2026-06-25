@@ -217,6 +217,13 @@ def _aissd_layer_reuse_enabled() -> bool:
     return _env_flag("AISSD_SPARSE_KV_LAYER_REUSE", "1")
 
 
+def _sparse_kv_e2e_log_reuse_enabled() -> bool:
+    # By default, sparse-KV e2e bandwidth is logged only on the layer that
+    # really runs the AISSD selector.  Reuse layers have selector_ms=0 and would
+    # otherwise produce misleading, inflated bandwidth numbers.
+    return _env_flag("AISSD_SPARSE_KV_E2E_LOG_REUSE", "0")
+
+
 def _aissd_backend_code(name: Any) -> int:
     value = str(name or "host").lower()
     if value == "ssd-cpu":
@@ -233,7 +240,7 @@ def _maybe_run_aissd_selector_op(
     head_size: int,
     num_heads: int,
     num_kv_heads: int,
-) -> None:
+) -> float:
     """Run AISSD q-aware selector before sparse FlashAttention.
 
     This is not the old Attention.forward Python hook.  The C++ op is invoked
@@ -245,7 +252,10 @@ def _maybe_run_aissd_selector_op(
     backend_name = step_context.get("aissd_selector_backend", "host")
     backend = _aissd_backend_code(backend_name)
     if backend == 0:
-        return
+        step_context["aissd_selector_ms"] = 0.0
+        step_context["aissd_selector_reused"] = False
+        step_context["aissd_selector_real_layer"] = None
+        return 0.0
 
     # CUDA graph capture / warmup can reach this backend before a real
     # SchedulerOutput has published candidate native extents.  Do not run AISSD
@@ -265,7 +275,10 @@ def _maybe_run_aissd_selector_op(
                 backend_name,
                 step_context.get("host_active_reqs"),
             )
-        return
+        step_context["aissd_selector_ms"] = 0.0
+        step_context["aissd_selector_reused"] = False
+        step_context["aissd_selector_real_layer"] = None
+        return 0.0
     if torch.cuda.is_current_stream_capturing():
         # This should normally only happen during CUDA graph capture with dummy
         # inputs.  Host RPC/CMB/SSD IO is not CUDA-graph-capturable, so never
@@ -276,7 +289,10 @@ def _maybe_run_aissd_selector_op(
                 layer_name,
                 backend_name,
             )
-        return
+        step_context["aissd_selector_ms"] = 0.0
+        step_context["aissd_selector_reused"] = False
+        step_context["aissd_selector_real_layer"] = None
+        return 0.0
 
     generation = int(step_context.get("context_generation", -1) or -1)
     if _aissd_layer_reuse_enabled():
@@ -289,7 +305,11 @@ def _maybe_run_aissd_selector_op(
                     generation,
                     step_context.get("aissd_selector_done_layer"),
                 )
-            return
+            step_context["aissd_selector_ms"] = 0.0
+            step_context["aissd_selector_reused"] = True
+            step_context["aissd_selector_real_layer"] = step_context.get("aissd_selector_done_layer")
+            step_context["aissd_selector_real_layer_id"] = step_context.get("aissd_selector_done_layer_id")
+            return 0.0
 
     required = (
         "aissd_candidate_count",
@@ -373,6 +393,14 @@ def _maybe_run_aissd_selector_op(
     )
     _sparse_profile_end(selector_prof, step_context, query, impl=str(backend_name))
     elapsed_ms = (time.perf_counter() - t0) * 1000.0
+    step_context["aissd_selector_ms"] = float(elapsed_ms)
+    step_context["aissd_selector_reused"] = False
+    step_context["aissd_selector_real_layer"] = str(layer_name)
+    step_context["aissd_selector_real_layer_id"] = int(layer_id)
+    step_context["aissd_selector_real_generation"] = int(generation)
+    step_context["aissd_selector_last_layer"] = str(layer_name)
+    step_context["aissd_selector_last_layer_id"] = int(layer_id)
+    step_context["aissd_selector_last_generation"] = int(generation)
     step_context["aissd_selector_done_generation"] = generation
     step_context["aissd_selector_done_layer"] = str(layer_name)
     step_context["aissd_selector_done_layer_id"] = int(layer_id)
@@ -390,6 +418,8 @@ def _maybe_run_aissd_selector_op(
             _aissd_layer_reuse_enabled(),
         )
 
+
+    return float(elapsed_ms)
 
 def _ensure_sparse_debug_counters(
     step_context: dict[str, Any],
@@ -416,6 +446,123 @@ def _read_sparse_debug_counters(counters: torch.Tensor) -> list[int]:
     if not isinstance(counters, torch.Tensor) or counters.numel() < 8:
         return [0] * 8
     return [int(x) for x in counters.detach().cpu().tolist()[:8]]
+
+
+def _as_float(value: Any, default: float = 0.0) -> float:
+    try:
+        if isinstance(value, torch.Tensor):
+            # Avoid synchronizing CUDA tensors for log-only metadata.
+            return default
+        return float(value)
+    except Exception:
+        return default
+
+
+def _as_int(value: Any, default: int = 0) -> int:
+    try:
+        if isinstance(value, torch.Tensor):
+            return default
+        return int(value)
+    except Exception:
+        return default
+
+
+def _sparse_gbps(num_bytes: int, ms: float) -> float:
+    if num_bytes <= 0 or ms <= 0.0:
+        return 0.0
+    return float(num_bytes) / (float(ms) / 1000.0) / 1.0e9
+
+
+def _log_sparse_kv_e2e_bandwidth(
+    *,
+    step_context: dict[str, Any] | None,
+    layer_name: str,
+    impl: str,
+    q_shape: Any,
+    selector_ms: float,
+    attention_ms: float,
+) -> None:
+    """Log sparse-KV end-to-end bandwidth from HOST selector start to FA end.
+
+    The numerator is selected KV bytes.  When real selected-load instrumentation
+    is available from LMCache, use it; otherwise use the step-level estimate
+    prepared by the connector from selected blocks/chunks and model KV shape.
+    """
+    if step_context is None or not _aissd_selector_stats_enabled():
+        return
+
+    selector_reused = bool(step_context.get("aissd_selector_reused", False))
+    real_layer = step_context.get("aissd_selector_real_layer")
+    if (
+        selector_reused
+        and not _sparse_kv_e2e_log_reuse_enabled()
+        and str(layer_name) != str(real_layer)
+    ):
+        if _sparse_kv_debug_enabled() and not torch.cuda.is_current_stream_capturing():
+            logger.info(
+                "[sparse-kv-e2e-bandwidth] skip_reuse layer=%s generation=%s "
+                "real_layer=%s selector_ms=%.3f",
+                layer_name,
+                step_context.get("context_generation"),
+                real_layer,
+                float(selector_ms),
+            )
+        return
+
+    if selector_ms <= 0.0 and not _sparse_kv_e2e_log_reuse_enabled():
+        # Do not report end-to-end bandwidth without a real selector timing.
+        # This happens on bootstrap/capture or layer-reuse paths.
+        return
+
+    load_ms = _as_float(step_context.get("sparse_selected_load_ms"), 0.0)
+    load_bytes = _as_int(step_context.get("sparse_selected_load_bytes"), 0)
+    selected_bytes = _as_int(step_context.get("sparse_selected_kv_bytes"), 0)
+    if selected_bytes <= 0:
+        selected_bytes = load_bytes
+    if load_bytes <= 0:
+        load_bytes = selected_bytes
+
+    selected_tokens = _as_int(step_context.get("sparse_selected_tokens"), 0)
+    selected_blocks = _as_int(step_context.get("sparse_selected_blocks"), 0)
+    host_reqs = _as_int(step_context.get("host_active_reqs"), 0)
+    candidates = step_context.get("aissd_candidate_count")
+    if isinstance(candidates, torch.Tensor):
+        candidates_repr = f"Tensor(shape={tuple(candidates.shape)}, device={candidates.device})"
+    else:
+        candidates_repr = candidates
+
+    # Selector -> selected KV ready -> FA-varlen/custom attention complete.
+    e2e_no_attn_ms = float(selector_ms) + float(load_ms)
+    e2e_with_attn_ms = e2e_no_attn_ms + float(attention_ms)
+    logger.info(
+        "[sparse-kv-e2e-bandwidth] layer=%s generation=%s impl=%s "
+        "q_shape=%s active_reqs=%s candidates=%s selected_blocks=%d "
+        "selected_tokens=%d selected_kv_bytes=%d selector_ms=%.3f "
+        "selected_load_ms=%.3f attention_ms=%.3f e2e_no_attn_ms=%.3f "
+        "e2e_with_attn_ms=%.3f selected_load_bw_GBps=%.6f "
+        "e2e_no_attn_bw_GBps=%.6f e2e_with_attn_bw_GBps=%.6f "
+        "bytes_source=%s selector_reused=%s real_selector_layer=%s",
+        layer_name,
+        step_context.get("context_generation"),
+        impl,
+        q_shape,
+        host_reqs,
+        candidates_repr,
+        selected_blocks,
+        selected_tokens,
+        selected_bytes,
+        float(selector_ms),
+        float(load_ms),
+        float(attention_ms),
+        e2e_no_attn_ms,
+        e2e_with_attn_ms,
+        _sparse_gbps(load_bytes, load_ms),
+        _sparse_gbps(selected_bytes, e2e_no_attn_ms),
+        _sparse_gbps(selected_bytes, e2e_with_attn_ms),
+        step_context.get("sparse_selected_kv_bytes_source", "unknown"),
+        selector_reused,
+        real_layer,
+    )
 
 
 def _sparse_tensor_ptr(tensor: Any) -> str:
@@ -1068,7 +1215,7 @@ class SparseSSDAttentionImpl(AttentionImpl[AttentionMetadata]):
                         )
 
                 sparse_total_prof = _sparse_profile_begin("sparse_forward_total", layer_name, query)
-                _maybe_run_aissd_selector_op(
+                selector_ms = _maybe_run_aissd_selector_op(
                     query=query,
                     step_context=step_context,
                     layer_name=layer_name,
@@ -1077,6 +1224,7 @@ class SparseSSDAttentionImpl(AttentionImpl[AttentionMetadata]):
                     num_kv_heads=int(self.num_kv_heads),
                 )
                 if impl in ("fa_varlen", "flash", "flash_attn", "flashattention"):
+                    attn_t0 = time.perf_counter()
                     result = self._forward_sparse_fa_varlen(
                         layer,
                         query,
@@ -1089,6 +1237,16 @@ class SparseSSDAttentionImpl(AttentionImpl[AttentionMetadata]):
                         output_block_scale,
                         step_context,
                         layer_name,
+                    )
+                    attention_ms = (time.perf_counter() - attn_t0) * 1000.0
+                    step_context["sparse_attention_ms"] = float(attention_ms)
+                    _log_sparse_kv_e2e_bandwidth(
+                        step_context=step_context,
+                        layer_name=layer_name,
+                        impl="fa_varlen",
+                        q_shape=tuple(query.shape),
+                        selector_ms=float(selector_ms),
+                        attention_ms=float(attention_ms),
                     )
                     _sparse_profile_end(
                         sparse_total_prof, step_context, query, impl="fa_varlen"
@@ -1115,6 +1273,7 @@ class SparseSSDAttentionImpl(AttentionImpl[AttentionMetadata]):
                     debug_counters.zero_()
 
                 custom_prof = _sparse_profile_begin("sparse_attention", layer_name, query)
+                attn_t0 = time.perf_counter()
                 vllm_ops.sparse_flash_attention(
                     output,
                     query,
@@ -1134,8 +1293,18 @@ class SparseSSDAttentionImpl(AttentionImpl[AttentionMetadata]):
                     int(step_context["top_n_chunks"]),
                     float(self.scale),
                 )
+                attention_ms = (time.perf_counter() - attn_t0) * 1000.0
+                step_context["sparse_attention_ms"] = float(attention_ms)
                 _sparse_profile_end(
                     custom_prof, step_context, query, impl="custom"
+                )
+                _log_sparse_kv_e2e_bandwidth(
+                    step_context=step_context,
+                    layer_name=layer_name,
+                    impl="custom",
+                    q_shape=tuple(query.shape),
+                    selector_ms=float(selector_ms),
+                    attention_ms=float(attention_ms),
                 )
                 if debug_enabled and not torch.cuda.is_current_stream_capturing():
                     (
