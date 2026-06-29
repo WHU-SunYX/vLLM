@@ -515,7 +515,12 @@ def _log_sparse_kv_e2e_bandwidth(
         return
 
     load_ms = _as_float(step_context.get("sparse_selected_load_ms"), 0.0)
+    load_wall_ms = _as_float(step_context.get("sparse_selected_load_wall_ms"), load_ms)
     load_bytes = _as_int(step_context.get("sparse_selected_load_bytes"), 0)
+    host_prepare_ms = _as_float(step_context.get("sparse_host_prepare_ms"), 0.0)
+    candidate_build_ms = _as_float(step_context.get("sparse_candidate_build_ms"), 0.0)
+    sparse_attn_prepare_ms = _as_float(step_context.get("sparse_attn_prepare_ms"), 0.0)
+    sparse_attention_kernel_ms = _as_float(step_context.get("sparse_attention_kernel_ms"), max(0.0, float(attention_ms) - sparse_attn_prepare_ms))
     selected_bytes = _as_int(step_context.get("sparse_selected_kv_bytes"), 0)
     if selected_bytes <= 0:
         selected_bytes = load_bytes
@@ -531,9 +536,13 @@ def _log_sparse_kv_e2e_bandwidth(
     else:
         candidates_repr = candidates
 
-    # Selector -> selected KV ready -> FA-varlen/custom attention complete.
-    e2e_no_attn_ms = float(selector_ms) + float(load_ms)
-    e2e_with_attn_ms = e2e_no_attn_ms + float(attention_ms)
+    # Selector -> selected KV ready -> sparse-attention input metadata prepared.
+    # sparse_kv_e2e_no_attn follows the experiment definition and stops before
+    # the attention kernel itself.  The legacy attention_ms is also logged.
+    selector_wall_ms = float(selector_ms)
+    selected_load_wall_ms = float(load_wall_ms)
+    e2e_no_attn_ms = selector_wall_ms + selected_load_wall_ms + float(sparse_attn_prepare_ms)
+    e2e_with_attn_ms = e2e_no_attn_ms + float(sparse_attention_kernel_ms)
     logger.info(
         "[sparse-kv-e2e-bandwidth] layer=%s generation=%s impl=%s "
         "q_shape=%s active_reqs=%s candidates=%s selected_blocks=%d "
@@ -562,6 +571,37 @@ def _log_sparse_kv_e2e_bandwidth(
         step_context.get("sparse_selected_kv_bytes_source", "unknown"),
         selector_reused,
         real_layer,
+    )
+
+    logger.info(
+        "[aissd-sparse-kv-e2e-breakdown] layer=%s generation=%s impl=%s "
+        "active_reqs=%d candidate_counts=%s selected_blocks=%d selected_tokens=%d "
+        "selected_kv_bytes=%d host_prepare_ms=%.3f candidate_build_ms=%.3f "
+        "selector_wall_ms=%.3f selected_kv_load_sum_ms=%.3f "
+        "selected_kv_load_wall_ms=%.3f sparse_attn_prepare_ms=%.3f "
+        "sparse_attn_kernel_ms=%.3f attention_total_ms=%.3f "
+        "e2e_no_attn_ms=%.3f e2e_with_attn_ms=%.3f "
+        "e2e_no_attn_bw_GBps=%.6f e2e_with_attn_bw_GBps=%.6f",
+        layer_name,
+        step_context.get("context_generation"),
+        impl,
+        host_reqs,
+        step_context.get("sparse_candidate_counts", candidates_repr),
+        selected_blocks,
+        selected_tokens,
+        selected_bytes,
+        host_prepare_ms,
+        candidate_build_ms,
+        selector_wall_ms,
+        float(load_ms),
+        selected_load_wall_ms,
+        float(sparse_attn_prepare_ms),
+        float(sparse_attention_kernel_ms),
+        float(attention_ms),
+        e2e_no_attn_ms,
+        e2e_with_attn_ms,
+        _sparse_gbps(selected_bytes, e2e_no_attn_ms),
+        _sparse_gbps(selected_bytes, e2e_with_attn_ms),
     )
 
 
@@ -1022,6 +1062,7 @@ class SparseSSDAttentionImpl(AttentionImpl[AttentionMetadata]):
                 "sparse FA-varlen path does not support fused output quantization"
             )
 
+        prepare_t0 = time.perf_counter()
         q_tokens = int(query.shape[0])
         fa_block_table = step_context.get("fa_block_table")
         fa_seq_lens = step_context.get("fa_seq_lens")
@@ -1121,7 +1162,23 @@ class SparseSSDAttentionImpl(AttentionImpl[AttentionMetadata]):
 
         self._write_sparse_fa_replay_marker(step_context, q_tokens)
 
+        prepare_ms = (time.perf_counter() - prepare_t0) * 1000.0
+        step_context["sparse_attn_prepare_ms"] = float(prepare_ms)
+        if _aissd_selector_stats_enabled() and not torch.cuda.is_current_stream_capturing():
+            logger.info(
+                "[aissd-sparse-attn-prepare] layer=%s generation=%s selected_blocks=%s "
+                "selected_tokens=%s q_tokens=%d fa_max_seq_len=%s prepare_ms=%.3f",
+                layer_name,
+                step_context.get("context_generation"),
+                step_context.get("host_selected_blocks"),
+                step_context.get("sparse_selected_tokens"),
+                q_tokens,
+                sparse_max_seq_len,
+                prepare_ms,
+            )
+
         fa_prof = _sparse_profile_begin("sparse_attention", layer_name, query)
+        kernel_t0 = time.perf_counter()
         try:
             result = self._fallback_impl.forward(
                 layer,
@@ -1135,6 +1192,7 @@ class SparseSSDAttentionImpl(AttentionImpl[AttentionMetadata]):
                 output_block_scale=output_block_scale,
             )
         finally:
+            step_context["sparse_attention_kernel_ms"] = float((time.perf_counter() - kernel_t0) * 1000.0)
             _sparse_profile_end(
                 fa_prof,
                 step_context,
