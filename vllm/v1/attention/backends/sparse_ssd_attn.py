@@ -210,6 +210,19 @@ def _aissd_selector_stats_enabled() -> bool:
     return _env_flag("AISSD_SPARSE_KV_SELECTOR_STATS", "0")
 
 
+def _aissd_sparse_kv_e2e_stats_enabled(
+    step_context: dict[str, Any] | None = None,
+) -> bool:
+    # Sparse KV E2E bandwidth/breakdown summary.  Keep
+    # AISSD_SPARSE_KV_SELECTOR_STATS as a compatibility alias, but allow the
+    # low-volume E2E summary to be enabled without high-volume selector logs.
+    if _env_flag("AISSD_SPARSE_KV_E2E_STATS", "0") or _aissd_selector_stats_enabled():
+        return True
+    if step_context is not None:
+        return bool(step_context.get("sparse_kv_e2e_stats_enabled", False))
+    return False
+
+
 def _aissd_layer_reuse_enabled() -> bool:
     # Current production bring-up policy: run q-aware AISSD selector once per
     # decode step/generation and reuse selected chunks across all layers.
@@ -488,7 +501,7 @@ def _log_sparse_kv_e2e_bandwidth(
     is available from LMCache, use it; otherwise use the step-level estimate
     prepared by the connector from selected blocks/chunks and model KV shape.
     """
-    if step_context is None or not _aissd_selector_stats_enabled():
+    if step_context is None or not _aissd_sparse_kv_e2e_stats_enabled(step_context):
         return
 
     selector_reused = bool(step_context.get("aissd_selector_reused", False))
