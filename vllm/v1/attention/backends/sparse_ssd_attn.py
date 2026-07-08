@@ -224,10 +224,248 @@ def _aissd_sparse_kv_e2e_stats_enabled(
 
 
 def _aissd_layer_reuse_enabled() -> bool:
-    # Current production bring-up policy: run q-aware AISSD selector once per
-    # decode step/generation and reuse selected chunks across all layers.
     # Disable with AISSD_SPARSE_KV_LAYER_REUSE=0 for exact per-layer selection.
+    # When enabled, AISSD_LAYER_REUSE_STRATEGY controls the reuse policy.
     return _env_flag("AISSD_SPARSE_KV_LAYER_REUSE", "1")
+
+
+def _aissd_layer_reuse_strategy() -> str:
+    # global: legacy behavior, run selector once per decode step and reuse it
+    # across all layers.
+    # static: IndexCache-style training-free policy.  Run selector only on
+    # AISSD_F_LAYERS and let other layers reuse the nearest previous F layer.
+    return str(os.environ.get("AISSD_LAYER_REUSE_STRATEGY", "global")).strip().lower()
+
+
+def _aissd_static_f_layers() -> tuple[int, ...]:
+    raw = str(os.environ.get("AISSD_F_LAYERS", "0,6,12,18,24,30,35")).strip()
+    layers: list[int] = []
+    for item in raw.split(","):
+        item = item.strip()
+        if not item:
+            continue
+        try:
+            layer_id = int(item)
+        except ValueError:
+            logger.warning(
+                "Ignoring invalid AISSD_F_LAYERS entry %r in %r",
+                item,
+                raw,
+            )
+            continue
+        if layer_id < 0:
+            logger.warning(
+                "Ignoring negative AISSD_F_LAYERS entry %r in %r",
+                item,
+                raw,
+            )
+            continue
+        layers.append(layer_id)
+    if not layers:
+        layers = [0]
+    return tuple(sorted(set(layers)))
+
+
+def _aissd_parse_layer_id(layer_name: str, step_context: dict[str, Any]) -> int:
+    layer_id = int(step_context.get("current_layer_id", -1))
+    if layer_id >= 0:
+        return layer_id
+    try:
+        import re
+
+        match = re.search(r"layers\.(\d+)", str(layer_name))
+        return int(match.group(1)) if match else 0
+    except Exception:
+        return 0
+
+
+def _aissd_static_reuse_source_layer_id(layer_id: int, f_layers: tuple[int, ...]) -> int:
+    # Nearest previous F layer.  If the first visible layer is before the first
+    # configured F layer, fall back to the first configured F layer.
+    source = f_layers[0]
+    for f_layer in f_layers:
+        if f_layer <= layer_id:
+            source = f_layer
+        else:
+            break
+    return int(source)
+
+
+def _aissd_env_int(name: str, default: int) -> int:
+    try:
+        return int(str(os.environ.get(name, str(default))).strip())
+    except Exception:
+        return int(default)
+
+
+def _aissd_token_reuse_strategy() -> str:
+    # legacy keeps the old behavior: selected metadata is reusable as long as
+    # context_generation matches.  It is intentionally retained as a fast
+    # fallback for experiments.
+    return str(os.environ.get("AISSD_TOKEN_REUSE_STRATEGY", "none")).strip().lower()
+
+
+def _aissd_token_reuse_is_legacy(strategy: str | None = None) -> bool:
+    if strategy is None:
+        strategy = _aissd_token_reuse_strategy()
+    return strategy in ("legacy", "long", "long_reuse")
+
+
+def _aissd_token_reuse_interval() -> int:
+    return max(1, _aissd_env_int("AISSD_TOKEN_REUSE_INTERVAL", 1))
+
+
+def _aissd_token_reuse_max_staleness() -> int:
+    value = _aissd_env_int("AISSD_TOKEN_REUSE_MAX_STALENESS", 0)
+    if value <= 0:
+        value = _aissd_token_reuse_interval()
+    return max(1, value)
+
+
+def _aissd_token_reuse_debug_enabled() -> bool:
+    return _env_flag("AISSD_TOKEN_REUSE_DEBUG", "0")
+
+
+def _aissd_token_reuse_overhead_log_enabled() -> bool:
+    return _env_flag("AISSD_TOKEN_REUSE_OVERHEAD_LOG", "0")
+
+
+def _aissd_tensor_int_list(value: Any, limit: int = 64) -> tuple[int, ...]:
+    if isinstance(value, torch.Tensor):
+        try:
+            data = value.detach()
+            if data.is_cuda:
+                data = data.cpu()
+            flat = data.reshape(-1)[:limit].tolist()
+            return tuple(int(x) for x in flat)
+        except Exception:
+            return ()
+    if isinstance(value, (list, tuple)):
+        try:
+            return tuple(int(x) for x in list(value)[:limit])
+        except Exception:
+            return ()
+    return ()
+
+
+def _aissd_token_reuse_virtual_step(
+    step_context: dict[str, Any],
+    generation: int,
+    layer_id: int,
+) -> int:
+    """Return a Python-side decode-step counter for token reuse.
+
+    req_token_lens is graph-stable in this path and can stay fixed across
+    decode iterations, so it must not be used as the token-reuse clock.  The
+    attention layers are visited in model order for each decode pass; when the
+    layer id wraps back to an earlier layer, we advance the virtual token step.
+    """
+    gen_key = "aissd_token_reuse_virtual_generation"
+    step_key = "aissd_token_reuse_virtual_step"
+    last_layer_key = "aissd_token_reuse_virtual_last_layer_id"
+
+    cur_generation = int(generation)
+    cur_layer_id = int(layer_id)
+    prev_generation = step_context.get(gen_key)
+    if prev_generation is None or int(prev_generation) != cur_generation:
+        step_context[gen_key] = cur_generation
+        step_context[step_key] = 0
+        step_context[last_layer_key] = cur_layer_id
+        return 0
+
+    step = int(step_context.get(step_key, 0) or 0)
+    last_layer = step_context.get(last_layer_key)
+    if last_layer is not None and cur_layer_id <= int(last_layer):
+        step += 1
+        step_context[step_key] = int(step)
+    step_context[last_layer_key] = cur_layer_id
+    return int(step)
+
+
+def _aissd_token_reuse_state(
+    step_context: dict[str, Any],
+    generation: int,
+    layer_id: int,
+    strategy: str | None = None,
+) -> dict[str, Any]:
+    if _aissd_token_reuse_is_legacy(strategy):
+        # Fast path for the old behavior: legacy reuse is gated only by
+        # context_generation. Avoid reading req_token_lens/active_reqs because
+        # converting tensors to Python lists can synchronize or add per-layer
+        # CPU overhead on the decode path.
+        return {
+            "generation": int(generation),
+            "token_step": int(generation),
+            "active_sig": (),
+            "token_sig": (),
+            "legacy_fast_path": True,
+        }
+
+    req_ids = step_context.get("req_ids")
+    if isinstance(req_ids, (list, tuple)):
+        active_sig = tuple(str(x) for x in req_ids)
+    else:
+        active_reqs = _aissd_tensor_int_list(step_context.get("active_reqs"))
+        if active_reqs:
+            active_sig = tuple(str(x) for x in active_reqs)
+        else:
+            active_sig = (str(step_context.get("host_active_reqs", 0)),)
+
+    token_step = _aissd_token_reuse_virtual_step(
+        step_context,
+        generation,
+        layer_id,
+    )
+    token_sig = (int(token_step),)
+
+    return {
+        "generation": int(generation),
+        "token_step": int(token_step),
+        "active_sig": active_sig,
+        "token_sig": token_sig,
+    }
+
+
+def _aissd_token_reuse_allows(
+    entry: dict[str, Any],
+    token_state: dict[str, Any],
+    strategy: str | None = None,
+) -> tuple[bool, str]:
+    if strategy is None:
+        strategy = _aissd_token_reuse_strategy()
+    if _aissd_token_reuse_is_legacy(strategy):
+        if int(entry.get("generation", -999999)) == int(token_state["generation"]):
+            return True, "legacy_generation_match"
+        return False, "legacy_generation_mismatch"
+
+    if tuple(entry.get("active_sig", ())) != tuple(token_state.get("active_sig", ())):
+        return False, "active_set_changed"
+
+    entry_step = int(entry.get("token_step", -999999))
+    cur_step = int(token_state["token_step"])
+    delta = cur_step - entry_step
+    if delta < 0:
+        return False, "token_step_rewind"
+
+    if strategy in ("none", "off", "every_token", "per_token"):
+        if delta == 0:
+            return True, "same_token"
+        return False, "every_token_refresh"
+
+    if strategy in ("fixed_interval", "interval", "hybrid"):
+        interval = _aissd_token_reuse_interval()
+        max_staleness = _aissd_token_reuse_max_staleness()
+        window = min(interval, max_staleness)
+        if delta < window:
+            return True, f"within_interval_{window}"
+        return False, f"stale_delta_{delta}_ge_{window}"
+
+    if strategy in ("always", "force"):
+        return True, "force_reuse"
+
+    if delta == 0:
+        return True, f"unknown_strategy_{strategy}_same_token"
+    return False, f"unknown_strategy_{strategy}_refresh"
 
 
 def _sparse_kv_e2e_log_reuse_enabled() -> bool:
@@ -244,6 +482,196 @@ def _aissd_backend_code(name: Any) -> int:
     if value == "ssd-npu":
         return 2
     return 0
+
+
+_AISSD_CANDIDATE_LAYER_KEYS = (
+    ("aissd_candidate_count", "aissd_layer_candidate_count"),
+    ("aissd_candidate_chunk_ids", "aissd_layer_candidate_chunk_ids"),
+    ("aissd_candidate_block_ids", "aissd_layer_candidate_block_ids"),
+    ("aissd_candidate_block_lens", "aissd_layer_candidate_block_lens"),
+    ("aissd_candidate_token_start", "aissd_layer_candidate_token_start"),
+    ("aissd_candidate_token_end", "aissd_layer_candidate_token_end"),
+    ("aissd_candidate_dtype", "aissd_layer_candidate_dtype"),
+    ("aissd_candidate_fmt", "aissd_layer_candidate_fmt"),
+    ("aissd_candidate_ndim", "aissd_layer_candidate_ndim"),
+    ("aissd_candidate_shape", "aissd_layer_candidate_shape"),
+    ("aissd_candidate_extent_count", "aissd_layer_candidate_extent_count"),
+    ("aissd_candidate_extent_lba", "aissd_layer_candidate_extent_lba"),
+    ("aissd_candidate_extent_bytes", "aissd_layer_candidate_extent_bytes"),
+)
+
+
+_AISSD_SELECTED_METADATA_KEYS = (
+    "selected_block_table",
+    "selected_block_lens",
+    "selected_ready_flags",
+    "fa_block_table",
+    "fa_seq_lens",
+)
+
+
+def _aissd_candidate_layer_ids(step_context: dict[str, Any]) -> list[int]:
+    ids = step_context.get("aissd_candidate_layer_ids")
+    if isinstance(ids, torch.Tensor):
+        try:
+            return [int(x) for x in ids.detach().cpu().tolist()]
+        except Exception:
+            return []
+    if isinstance(ids, (list, tuple)):
+        try:
+            return [int(x) for x in ids]
+        except Exception:
+            return []
+    return []
+
+
+def _aissd_select_candidate_tensors_for_layer(
+    step_context: dict[str, Any],
+    layer_id: int,
+) -> None:
+    layer_ids = _aissd_candidate_layer_ids(step_context)
+    if not layer_ids:
+        return
+    if int(layer_id) not in layer_ids:
+        raise RuntimeError(
+            "AISSD static selector requested layer_id="
+            f"{layer_id}, but prepare_sparse_kv_step() only built candidate "
+            f"metadata for layers={layer_ids}. Check AISSD_F_LAYERS and "
+            "qkpack layer configuration."
+        )
+    layer_pos = layer_ids.index(int(layer_id))
+    for target_key, layered_key in _AISSD_CANDIDATE_LAYER_KEYS:
+        layered = step_context.get(layered_key)
+        if not isinstance(layered, torch.Tensor):
+            continue
+        if layered.dim() <= 0 or layer_pos >= int(layered.shape[0]):
+            raise RuntimeError(
+                f"AISSD layered candidate tensor {layered_key} has invalid "
+                f"shape={tuple(layered.shape)} for layer_pos={layer_pos}"
+            )
+        step_context[target_key] = layered[layer_pos]
+    step_context["aissd_candidate_active_layer_id"] = int(layer_id)
+
+
+def _aissd_selected_cache(step_context: dict[str, Any]) -> dict[int, dict[str, Any]]:
+    cache = step_context.get("aissd_selected_metadata_cache")
+    if not isinstance(cache, dict):
+        cache = {}
+        step_context["aissd_selected_metadata_cache"] = cache
+    return cache
+
+
+def _aissd_cache_selected_metadata(
+    step_context: dict[str, Any],
+    source_layer_id: int,
+    source_layer_name: str,
+    generation: int,
+    token_state: dict[str, Any],
+    strategy: str | None = None,
+) -> None:
+    if strategy is None:
+        strategy = _aissd_token_reuse_strategy()
+    entry: dict[str, Any] = {
+        "generation": int(generation),
+        "source_layer_id": int(source_layer_id),
+        "source_layer_name": str(source_layer_name),
+        "token_step": int(token_state["token_step"]),
+        "active_sig": tuple(token_state.get("active_sig", ())),
+        "token_sig": tuple(token_state.get("token_sig", ())),
+        "token_reuse_strategy": strategy,
+    }
+    copy_bytes = 0
+    for key in _AISSD_SELECTED_METADATA_KEYS:
+        tensor = step_context.get(key)
+        if not isinstance(tensor, torch.Tensor):
+            raise RuntimeError(f"AISSD selected metadata cache missing tensor {key}")
+        entry[key] = tensor.detach().clone()
+        copy_bytes += int(tensor.numel()) * int(tensor.element_size())
+    _aissd_selected_cache(step_context)[int(source_layer_id)] = entry
+    step_context["aissd_selected_metadata_active_layer_id"] = int(source_layer_id)
+    step_context["aissd_selected_metadata_active_layer_name"] = str(source_layer_name)
+    step_context["aissd_selected_metadata_active_generation"] = int(generation)
+    step_context["aissd_selected_metadata_active_token_step"] = int(token_state["token_step"])
+    step_context["aissd_token_reuse_cache_copy_count"] = len(_AISSD_SELECTED_METADATA_KEYS)
+    step_context["aissd_token_reuse_cache_copy_bytes"] = int(copy_bytes)
+
+
+def _aissd_selected_metadata_is_active(
+    step_context: dict[str, Any],
+    source_layer_id: int,
+    generation: int,
+    token_state: dict[str, Any],
+    strategy: str,
+) -> bool:
+    if int(step_context.get("aissd_selected_metadata_active_layer_id", -999999)) != int(
+        source_layer_id
+    ):
+        return False
+    if int(step_context.get("aissd_selected_metadata_active_generation", -999999)) != int(
+        generation
+    ):
+        return False
+    if _aissd_token_reuse_is_legacy(strategy):
+        return True
+    return int(step_context.get("aissd_selected_metadata_active_token_step", -999999)) == int(
+        token_state["token_step"]
+    )
+
+
+def _aissd_restore_selected_metadata(
+    step_context: dict[str, Any],
+    source_layer_id: int,
+    generation: int,
+    token_state: dict[str, Any],
+    strategy: str | None = None,
+) -> bool:
+    if strategy is None:
+        strategy = _aissd_token_reuse_strategy()
+    step_context["aissd_token_reuse_restore_copy_count"] = 0
+    step_context["aissd_token_reuse_restore_copy_bytes"] = 0
+    step_context["aissd_token_reuse_restore_skip_active"] = False
+    entry = _aissd_selected_cache(step_context).get(int(source_layer_id))
+    if not isinstance(entry, dict):
+        step_context["aissd_token_reuse_last_reason"] = "missing_cache_entry"
+        return False
+    allowed, reason = _aissd_token_reuse_allows(entry, token_state, strategy)
+    step_context["aissd_token_reuse_last_reason"] = reason
+    step_context["aissd_token_reuse_cached_token_step"] = entry.get("token_step")
+    if not allowed:
+        return False
+
+    if _aissd_selected_metadata_is_active(
+        step_context, source_layer_id, generation, token_state, strategy
+    ):
+        step_context["aissd_token_reuse_restore_skip_active"] = True
+        step_context["aissd_token_reuse_last_reason"] = f"{reason}_already_active"
+        return True
+
+    copy_count = 0
+    copy_bytes = 0
+    for key in _AISSD_SELECTED_METADATA_KEYS:
+        cached = entry.get(key)
+        dst = step_context.get(key)
+        if not isinstance(cached, torch.Tensor) or not isinstance(dst, torch.Tensor):
+            return False
+        if tuple(cached.shape) != tuple(dst.shape):
+            raise RuntimeError(
+                f"AISSD selected metadata cache shape mismatch for {key}: "
+                f"cached={tuple(cached.shape)} dst={tuple(dst.shape)}"
+            )
+        dst.copy_(cached, non_blocking=True)
+        copy_count += 1
+        copy_bytes += int(cached.numel()) * int(cached.element_size())
+    step_context["aissd_selected_metadata_active_layer_id"] = int(source_layer_id)
+    step_context["aissd_selected_metadata_active_layer_name"] = str(
+        entry.get("source_layer_name", source_layer_id)
+    )
+    step_context["aissd_selected_metadata_active_generation"] = int(generation)
+    step_context["aissd_selected_metadata_active_token_step"] = int(token_state["token_step"])
+    step_context["aissd_token_reuse_last_reason"] = reason
+    step_context["aissd_token_reuse_restore_copy_count"] = int(copy_count)
+    step_context["aissd_token_reuse_restore_copy_bytes"] = int(copy_bytes)
+    return True
 
 
 def _maybe_run_aissd_selector_op(
@@ -308,18 +736,126 @@ def _maybe_run_aissd_selector_op(
         return 0.0
 
     generation = int(step_context.get("context_generation", -1) or -1)
+    token_reuse_strategy = _aissd_token_reuse_strategy()
+    overhead_log_enabled = _aissd_token_reuse_overhead_log_enabled()
+    layer_id = _aissd_parse_layer_id(layer_name, step_context)
+    token_state_t0 = time.perf_counter()
+    token_state = _aissd_token_reuse_state(
+        step_context, generation, layer_id, token_reuse_strategy
+    )
+    token_state_ms = (time.perf_counter() - token_state_t0) * 1000.0
     if _aissd_layer_reuse_enabled():
-        done_generation = int(step_context.get("aissd_selector_done_generation", -999999) or -999999)
-        if done_generation == generation:
+        done_generation = int(
+            step_context.get("aissd_selector_done_generation", -999999) or -999999
+        )
+        done_layer_id = int(
+            step_context.get("aissd_selector_done_layer_id", -999999) or -999999
+        )
+        strategy = _aissd_layer_reuse_strategy()
+        if strategy == "static":
+            f_layers = _aissd_static_f_layers()
+            source_layer_id = _aissd_static_reuse_source_layer_id(layer_id, f_layers)
+            restore_t0 = time.perf_counter()
+            restored = _aissd_restore_selected_metadata(
+                step_context,
+                source_layer_id,
+                generation,
+                token_state,
+                token_reuse_strategy,
+            )
+            restore_ms = (time.perf_counter() - restore_t0) * 1000.0
+            if overhead_log_enabled:
+                logger.info(
+                    "[aissd-token-reuse-overhead] op=restore layer=%s layer_id=%s "
+                    "generation=%s strategy=%s source_layer_id=%s hit=%s "
+                    "state_ms=%.6f restore_ms=%.6f copy_count=%s copy_bytes=%s "
+                    "skip_active=%s token_step=%s cached_token_step=%s reason=%s",
+                    layer_name,
+                    layer_id,
+                    generation,
+                    token_reuse_strategy,
+                    source_layer_id,
+                    restored,
+                    token_state_ms,
+                    restore_ms,
+                    step_context.get("aissd_token_reuse_restore_copy_count", 0),
+                    step_context.get("aissd_token_reuse_restore_copy_bytes", 0),
+                    step_context.get("aissd_token_reuse_restore_skip_active", False),
+                    token_state.get("token_step"),
+                    step_context.get("aissd_token_reuse_cached_token_step"),
+                    step_context.get("aissd_token_reuse_last_reason"),
+                )
+            if restored:
+                if _aissd_selector_stats_enabled() or _sparse_kv_debug_enabled():
+                    logger.info(
+                        "[aissd-selector-op] reuse layer=%s layer_id=%s "
+                        "generation=%s strategy=static source_layer_id=%s "
+                        "source_layer_id_active=%s token_reuse_strategy=%s "
+                        "token_step=%s cached_token_step=%s token_reuse_reason=%s "
+                        "f_layers=%s",
+                        layer_name,
+                        layer_id,
+                        generation,
+                        source_layer_id,
+                        step_context.get("aissd_selected_metadata_active_layer_id"),
+                        token_reuse_strategy,
+                        token_state.get("token_step"),
+                        step_context.get("aissd_token_reuse_cached_token_step"),
+                        step_context.get("aissd_token_reuse_last_reason"),
+                        ",".join(str(x) for x in f_layers),
+                    )
+                step_context["aissd_selector_ms"] = 0.0
+                step_context["aissd_selector_reused"] = True
+                step_context["aissd_selector_reuse_strategy"] = "static"
+                step_context["aissd_selector_token_reuse_strategy"] = token_reuse_strategy
+                step_context["aissd_selector_token_step"] = int(token_state["token_step"])
+                step_context["aissd_selector_token_reuse_reason"] = step_context.get(
+                    "aissd_token_reuse_last_reason"
+                )
+                step_context["aissd_selector_reuse_source_layer_id"] = source_layer_id
+                step_context["aissd_selector_real_layer"] = step_context.get(
+                    "aissd_selected_metadata_active_layer_name"
+                )
+                step_context["aissd_selector_real_layer_id"] = source_layer_id
+                return 0.0
+            if layer_id not in f_layers:
+                raise RuntimeError(
+                    "AISSD static reuse metadata is not ready for non-F layer "
+                    f"layer={layer_name} layer_id={layer_id} source_layer_id={source_layer_id} "
+                    f"generation={generation}. This layer must reuse selected metadata "
+                    "from its nearest previous F layer; it must not fallback to running "
+                    "a selector."
+                )
+            _aissd_select_candidate_tensors_for_layer(step_context, layer_id)
             if _aissd_selector_stats_enabled() or _sparse_kv_debug_enabled():
                 logger.info(
-                    "[aissd-selector-op] reuse layer=%s generation=%s first_layer=%s",
+                    "[aissd-selector-op] run layer=%s layer_id=%s generation=%s "
+                    "strategy=static candidate_layer_id=%s token_reuse_strategy=%s "
+                    "token_step=%s previous_cached_token_step=%s token_reuse_reason=%s "
+                    "f_layers=%s",
+                    layer_name,
+                    layer_id,
+                    generation,
+                    step_context.get("aissd_candidate_active_layer_id"),
+                    token_reuse_strategy,
+                    token_state.get("token_step"),
+                    step_context.get("aissd_token_reuse_cached_token_step"),
+                    step_context.get("aissd_token_reuse_last_reason"),
+                    ",".join(str(x) for x in f_layers),
+                )
+        elif done_generation == generation:
+            if _aissd_selector_stats_enabled() or _sparse_kv_debug_enabled():
+                logger.info(
+                    "[aissd-selector-op] reuse layer=%s generation=%s "
+                    "strategy=%s first_layer=%s",
                     layer_name,
                     generation,
+                    strategy or "global",
                     step_context.get("aissd_selector_done_layer"),
                 )
             step_context["aissd_selector_ms"] = 0.0
             step_context["aissd_selector_reused"] = True
+            step_context["aissd_selector_reuse_strategy"] = strategy or "global"
             step_context["aissd_selector_real_layer"] = step_context.get("aissd_selector_done_layer")
             step_context["aissd_selector_real_layer_id"] = step_context.get("aissd_selector_done_layer_id")
             return 0.0
@@ -350,14 +886,6 @@ def _maybe_run_aissd_selector_op(
             "prepare_sparse_kv_step() did not publish AISSD candidate extents "
             "for a real request."
         )
-    layer_id = int(step_context.get("current_layer_id", -1))
-    if layer_id < 0:
-        try:
-            import re
-            m = re.search(r"layers\.(\d+)", str(layer_name))
-            layer_id = int(m.group(1)) if m else 0
-        except Exception:
-            layer_id = 0
     if _sparse_kv_debug_enabled() and not torch.cuda.is_current_stream_capturing():
         logger.info(
             "[aissd-selector-op] layer=%s backend=%s q_shape=%s active_reqs=%s",
@@ -404,10 +932,45 @@ def _maybe_run_aissd_selector_op(
         int(step_context.get("aissd_manifest_block_size", 4096)),
         int(step_context.get("aissd_timeout_ms", 300000)),
     )
+    if _aissd_layer_reuse_enabled() and _aissd_layer_reuse_strategy() == "static":
+        cache_t0 = time.perf_counter()
+        _aissd_cache_selected_metadata(
+            step_context,
+            layer_id,
+            layer_name,
+            generation,
+            token_state,
+            token_reuse_strategy,
+        )
+        cache_ms = (time.perf_counter() - cache_t0) * 1000.0
+        if overhead_log_enabled:
+            logger.info(
+                "[aissd-token-reuse-overhead] op=cache layer=%s layer_id=%s "
+                "generation=%s strategy=%s state_ms=%.6f cache_ms=%.6f "
+                "copy_count=%s copy_bytes=%s token_step=%s",
+                layer_name,
+                layer_id,
+                generation,
+                token_reuse_strategy,
+                token_state_ms,
+                cache_ms,
+                step_context.get("aissd_token_reuse_cache_copy_count", 0),
+                step_context.get("aissd_token_reuse_cache_copy_bytes", 0),
+                token_state.get("token_step"),
+            )
     _sparse_profile_end(selector_prof, step_context, query, impl=str(backend_name))
     elapsed_ms = (time.perf_counter() - t0) * 1000.0
     step_context["aissd_selector_ms"] = float(elapsed_ms)
     step_context["aissd_selector_reused"] = False
+    step_context["aissd_selector_reuse_strategy"] = (
+        _aissd_layer_reuse_strategy() if _aissd_layer_reuse_enabled() else "none"
+    )
+    step_context["aissd_selector_reuse_source_layer_id"] = int(layer_id)
+    step_context["aissd_selector_token_reuse_strategy"] = token_reuse_strategy
+    step_context["aissd_selector_token_step"] = int(token_state["token_step"])
+    step_context["aissd_selector_token_reuse_reason"] = "selector_refreshed"
+    if _aissd_layer_reuse_strategy() == "static":
+        step_context["aissd_selector_f_layers"] = _aissd_static_f_layers()
     step_context["aissd_selector_real_layer"] = str(layer_name)
     step_context["aissd_selector_real_layer_id"] = int(layer_id)
     step_context["aissd_selector_real_generation"] = int(generation)
@@ -420,7 +983,9 @@ def _maybe_run_aissd_selector_op(
     if _aissd_selector_stats_enabled():
         logger.info(
             "[aissd-selector-latency] layer=%s generation=%s backend=%s "
-            "elapsed_ms=%.3f active_reqs=%s candidates=%s top_n=%s reuse_layers=%s",
+            "elapsed_ms=%.3f active_reqs=%s candidates=%s top_n=%s "
+            "reuse_layers=%s reuse_strategy=%s token_reuse_strategy=%s "
+            "token_step=%s f_layers=%s",
             layer_name,
             generation,
             backend_name,
@@ -429,6 +994,12 @@ def _maybe_run_aissd_selector_op(
             step_context.get("aissd_candidate_count"),
             step_context.get("top_n_chunks"),
             _aissd_layer_reuse_enabled(),
+            step_context.get("aissd_selector_reuse_strategy"),
+            step_context.get("aissd_selector_token_reuse_strategy"),
+            step_context.get("aissd_selector_token_step"),
+            ",".join(str(x) for x in _aissd_static_f_layers())
+            if _aissd_layer_reuse_strategy() == "static"
+            else "",
         )
 
 
