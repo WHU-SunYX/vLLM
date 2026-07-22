@@ -298,6 +298,13 @@ def _aissd_env_int(name: str, default: int) -> int:
         return int(default)
 
 
+def _aissd_env_float(name: str, default: float) -> float:
+    try:
+        return float(str(os.environ.get(name, str(default))).strip())
+    except Exception:
+        return float(default)
+
+
 def _aissd_token_reuse_strategy() -> str:
     # legacy keeps the old behavior: selected metadata is reusable as long as
     # context_generation matches.  It is intentionally retained as a fast
@@ -309,6 +316,12 @@ def _aissd_token_reuse_is_legacy(strategy: str | None = None) -> bool:
     if strategy is None:
         strategy = _aissd_token_reuse_strategy()
     return strategy in ("legacy", "long", "long_reuse")
+
+
+def _aissd_token_reuse_is_q_drift(strategy: str | None = None) -> bool:
+    if strategy is None:
+        strategy = _aissd_token_reuse_strategy()
+    return strategy in ("q_drift", "q-drift", "qdrift")
 
 
 def _aissd_token_reuse_interval() -> int:
@@ -324,6 +337,43 @@ def _aissd_token_reuse_max_staleness() -> int:
 
 def _aissd_token_reuse_debug_enabled() -> bool:
     return _env_flag("AISSD_TOKEN_REUSE_DEBUG", "0")
+
+
+def _aissd_q_drift_reduce() -> str:
+    """Return the statistic used by q_drift to make the reuse decision.
+
+    p95 is the default for the current experimental policy because a global
+    request x head maximum was observed to reject every adjacent-token sample.
+    Set AISSD_TOKEN_REUSE_Q_REDUCE=max to restore the original conservative
+    maximum-based behavior.
+    """
+    value = str(os.environ.get("AISSD_TOKEN_REUSE_Q_REDUCE", "p95")).strip().lower()
+    if value in ("max", "maximum", "amax"):
+        return "max"
+    if value in ("p95", "95", "percentile95", "quantile95"):
+        return "p95"
+    return "p95"
+
+
+def _aissd_q_drift_cos_threshold() -> float:
+    # Initial p95 threshold derived from the short Q-drift distribution run.
+    return max(0.0, _aissd_env_float("AISSD_TOKEN_REUSE_Q_COS_THRESHOLD", 0.70))
+
+
+def _aissd_q_drift_rel_l2_threshold() -> float:
+    # Initial p95 threshold derived from the short Q-drift distribution run.
+    return max(0.0, _aissd_env_float("AISSD_TOKEN_REUSE_Q_REL_L2_THRESHOLD", 1.20))
+
+
+def _aissd_q_drift_max_staleness() -> int:
+    # Start with one-token reuse only: age=1 may reuse, age>=2 refreshes the
+    # anchor. Increase this only after measuring age=2/4 drift and top-n overlap.
+    value = _aissd_env_int("AISSD_TOKEN_REUSE_Q_DRIFT_MAX_STALENESS", 0)
+    if value <= 0:
+        value = _aissd_env_int("AISSD_TOKEN_REUSE_MAX_STALENESS", 0)
+    if value <= 0:
+        value = 2
+    return max(1, int(value))
 
 
 def _aissd_token_reuse_overhead_log_enabled() -> bool:
@@ -346,6 +396,293 @@ def _aissd_tensor_int_list(value: Any, limit: int = 64) -> tuple[int, ...]:
         except Exception:
             return ()
     return ()
+
+
+def _aissd_q_drift_query_view(
+    query: torch.Tensor,
+    host_active_reqs: int,
+    num_heads: int,
+    head_size: int,
+) -> torch.Tensor | None:
+    """Return the active decode Q rows as [request, head, head_dim].
+
+    The initial implementation assumes one decode query row per active request.
+    CUDA-graph padding is tolerated by slicing the leading active rows.
+    """
+    if not isinstance(query, torch.Tensor) or query.dim() <= 0:
+        return None
+    active_reqs = int(host_active_reqs)
+    heads = int(num_heads)
+    dim = int(head_size)
+    if active_reqs <= 0 or heads <= 0 or dim <= 0:
+        return None
+    if int(query.shape[0]) < active_reqs:
+        return None
+    active = query[:active_reqs]
+    expected = active_reqs * heads * dim
+    if int(active.numel()) != expected:
+        return None
+    return active.reshape(active_reqs, heads, dim)
+
+
+def _aissd_current_candidate_signature(
+    step_context: dict[str, Any],
+) -> tuple[int, ...]:
+    value = step_context.get("aissd_candidate_signature")
+    active_reqs = max(0, int(step_context.get("host_active_reqs", 0) or 0))
+    if isinstance(value, torch.Tensor):
+        try:
+            data = value.detach()
+            if data.is_cuda:
+                data = data.cpu()
+            return tuple(int(x) for x in data.reshape(-1)[:active_reqs].tolist())
+        except Exception:
+            return ()
+    if isinstance(value, (list, tuple)):
+        try:
+            return tuple(int(x) for x in list(value)[:active_reqs])
+        except Exception:
+            return ()
+    return ()
+
+
+def _aissd_q_drift_metric_stats(
+    values: torch.Tensor,
+    threshold: float,
+) -> dict[str, Any]:
+    """Summarize one [request, head] drift tensor for threshold tuning.
+
+    This function is called only when AISSD_TOKEN_REUSE_OVERHEAD_LOG=1.  The
+    tensor is small (active requests x Q heads), so copying it to CPU keeps the
+    production decision path simple and makes percentile values deterministic.
+    """
+    cpu = values.detach().to(device="cpu", dtype=torch.float32)
+    if cpu.dim() != 2 or cpu.numel() == 0:
+        return {}
+
+    flat = cpu.reshape(-1)
+    req_max = torch.amax(cpu, dim=-1)
+    quantile_points = torch.tensor(
+        [0.50, 0.90, 0.95, 0.99], dtype=torch.float32
+    )
+    p50, p90, p95, p99 = (
+        float(x) for x in torch.quantile(flat, quantile_points).tolist()
+    )
+    req_p50, req_p95 = (
+        float(x)
+        for x in torch.quantile(
+            req_max, torch.tensor([0.50, 0.95], dtype=torch.float32)
+        ).tolist()
+    )
+
+    worst_flat = int(torch.argmax(flat).item())
+    heads = int(cpu.shape[1])
+    return {
+        "mean": float(torch.mean(flat).item()),
+        "p50": p50,
+        "p90": p90,
+        "p95": p95,
+        "p99": p99,
+        "max": float(torch.amax(flat).item()),
+        "exceed_ratio": float(torch.mean((flat > float(threshold)).float()).item()),
+        "reqmax_mean": float(torch.mean(req_max).item()),
+        "reqmax_p50": req_p50,
+        "reqmax_p95": req_p95,
+        "reqmax_max": float(torch.amax(req_max).item()),
+        "req_exceed_ratio": float(
+            torch.mean((req_max > float(threshold)).float()).item()
+        ),
+        "worst_req": int(worst_flat // heads),
+        "worst_head": int(worst_flat % heads),
+    }
+
+
+def _aissd_compute_q_drift(
+    current_q: torch.Tensor,
+    anchor_q: torch.Tensor,
+    *,
+    collect_distribution: bool = False,
+) -> tuple[float, float, float, float, dict[str, Any] | None]:
+    """Return decision drift, maxima, and optional diagnostic distributions.
+
+    AISSD_TOKEN_REUSE_Q_REDUCE selects the statistic used by the live decision:
+    ``p95`` computes the 95th percentile over all active request x head samples,
+    while ``max`` preserves the original global-maximum policy. Full mean/p50/
+    p90/p95/p99 diagnostics are collected only when overhead logging is enabled.
+    """
+    if not isinstance(current_q, torch.Tensor) or not isinstance(anchor_q, torch.Tensor):
+        return float("inf"), float("inf"), float("inf"), float("inf"), None
+    if tuple(current_q.shape) != tuple(anchor_q.shape):
+        return float("inf"), float("inf"), float("inf"), float("inf"), None
+
+    q = current_q.detach().float()
+    a = anchor_q.detach().to(device=q.device, dtype=torch.float32)
+    dot = torch.sum(q * a, dim=-1)
+    q_norm = torch.linalg.vector_norm(q, dim=-1)
+    a_norm = torch.linalg.vector_norm(a, dim=-1)
+    denom = torch.clamp(q_norm * a_norm, min=1.0e-12)
+    cos_drift = 1.0 - (dot / denom)
+    rel_l2 = torch.linalg.vector_norm(q - a, dim=-1) / torch.clamp(
+        a_norm, min=1.0e-12
+    )
+
+    reduce = _aissd_q_drift_reduce()
+    distribution: dict[str, Any] | None = None
+    if collect_distribution:
+        cos_stats = _aissd_q_drift_metric_stats(
+            cos_drift, _aissd_q_drift_cos_threshold()
+        )
+        rel_stats = _aissd_q_drift_metric_stats(
+            rel_l2, _aissd_q_drift_rel_l2_threshold()
+        )
+        max_cos = float(cos_stats.get("max", float("inf")))
+        max_rel_l2 = float(rel_stats.get("max", float("inf")))
+        if reduce == "p95":
+            decision_cos = float(cos_stats.get("p95", float("inf")))
+            decision_rel_l2 = float(rel_stats.get("p95", float("inf")))
+        else:
+            decision_cos = max_cos
+            decision_rel_l2 = max_rel_l2
+        distribution = {
+            "active_reqs": int(cos_drift.shape[0]),
+            "heads": int(cos_drift.shape[1]),
+            "samples": int(cos_drift.numel()),
+            "decision_reduce": reduce,
+            "decision_cos": decision_cos,
+            "decision_rel_l2": decision_rel_l2,
+            "cos": cos_stats,
+            "rel_l2": rel_stats,
+        }
+    else:
+        max_cos = float(torch.amax(cos_drift).item())
+        max_rel_l2 = float(torch.amax(rel_l2).item())
+        if reduce == "p95":
+            # This statistic is part of the live decision, so it must still be
+            # computed when diagnostic logging is disabled. The tensors are tiny
+            # (active requests x Q heads); only two scalar readbacks are needed.
+            decision_cos = float(torch.quantile(cos_drift.reshape(-1), 0.95).item())
+            decision_rel_l2 = float(torch.quantile(rel_l2.reshape(-1), 0.95).item())
+        else:
+            decision_cos = max_cos
+            decision_rel_l2 = max_rel_l2
+
+    values = (decision_cos, decision_rel_l2, max_cos, max_rel_l2)
+    if any(not (value == value) for value in values):
+        return float("inf"), float("inf"), float("inf"), float("inf"), distribution
+    return decision_cos, decision_rel_l2, max_cos, max_rel_l2, distribution
+
+
+def _aissd_q_drift_log_value(value: Any) -> str:
+    if value is None:
+        return "NA"
+    try:
+        return f"{float(value):.8f}"
+    except Exception:
+        return "NA"
+
+
+def _aissd_log_q_drift_decision(
+    *,
+    step_context: dict[str, Any],
+    layer_name: str,
+    layer_id: int,
+    token_state: dict[str, Any],
+    restored: bool,
+) -> None:
+    # Reuse the existing token-reuse diagnostics switch; do not introduce a
+    # second Q-drift-specific log switch. This emits only for F layers.
+    if not _aissd_token_reuse_overhead_log_enabled():
+        return
+
+    cos_value = step_context.get("aissd_q_drift_cos_max")
+    rel_value = step_context.get("aissd_q_drift_rel_l2_max")
+    cos_decision = step_context.get("aissd_q_drift_cos_decision")
+    rel_decision = step_context.get("aissd_q_drift_rel_l2_decision")
+    decision_reduce = step_context.get(
+        "aissd_q_drift_decision_reduce", _aissd_q_drift_reduce()
+    )
+    check_ms = float(step_context.get("aissd_q_drift_check_ms", 0.0) or 0.0)
+    candidate_same = step_context.get("aissd_q_drift_candidate_same")
+    anchor_step = step_context.get("aissd_q_drift_anchor_step")
+    age = step_context.get("aissd_q_drift_anchor_age")
+    reason = step_context.get("aissd_token_reuse_last_reason", "unknown")
+    distribution = step_context.get("aissd_q_drift_distribution")
+
+    if isinstance(distribution, dict):
+        cos_stats = distribution.get("cos") or {}
+        rel_stats = distribution.get("rel_l2") or {}
+        metrics_state = "available"
+        active_reqs: Any = distribution.get("active_reqs")
+        heads: Any = distribution.get("heads")
+        samples: Any = distribution.get("samples")
+    else:
+        cos_stats = {}
+        rel_stats = {}
+        metrics_state = "NA"
+        active_reqs = "NA"
+        heads = "NA"
+        samples = "NA"
+
+    logger.info(
+        "[aissd-token-q-drift-threshold] layer=%s layer_id=%s token_step=%s "
+        "anchor_step=%s anchor_age=%s candidate_same=%s decision_reduce=%s "
+        "decision=%s reason=%s q_metrics=%s active_reqs=%s heads=%s samples=%s "
+        "cos_threshold=%.8f cos_decision=%s cos_mean=%s cos_p50=%s cos_p90=%s cos_p95=%s "
+        "cos_p99=%s cos_max=%s cos_exceed_ratio=%s cos_reqmax_mean=%s "
+        "cos_reqmax_p50=%s cos_reqmax_p95=%s cos_reqmax_max=%s "
+        "cos_req_exceed_ratio=%s cos_worst_req=%s cos_worst_head=%s "
+        "rel_l2_threshold=%.8f rel_l2_decision=%s rel_l2_mean=%s rel_l2_p50=%s rel_l2_p90=%s "
+        "rel_l2_p95=%s rel_l2_p99=%s rel_l2_max=%s rel_l2_exceed_ratio=%s "
+        "rel_l2_reqmax_mean=%s rel_l2_reqmax_p50=%s rel_l2_reqmax_p95=%s "
+        "rel_l2_reqmax_max=%s rel_l2_req_exceed_ratio=%s "
+        "rel_l2_worst_req=%s rel_l2_worst_head=%s check_ms=%.6f",
+        layer_name,
+        layer_id,
+        token_state.get("token_step"),
+        anchor_step,
+        age,
+        candidate_same,
+        decision_reduce,
+        "reuse" if restored else "refresh",
+        reason,
+        metrics_state,
+        active_reqs,
+        heads,
+        samples,
+        _aissd_q_drift_cos_threshold(),
+        _aissd_q_drift_log_value(cos_decision),
+        _aissd_q_drift_log_value(cos_stats.get("mean")),
+        _aissd_q_drift_log_value(cos_stats.get("p50")),
+        _aissd_q_drift_log_value(cos_stats.get("p90")),
+        _aissd_q_drift_log_value(cos_stats.get("p95")),
+        _aissd_q_drift_log_value(cos_stats.get("p99")),
+        _aissd_q_drift_log_value(cos_value),
+        _aissd_q_drift_log_value(cos_stats.get("exceed_ratio")),
+        _aissd_q_drift_log_value(cos_stats.get("reqmax_mean")),
+        _aissd_q_drift_log_value(cos_stats.get("reqmax_p50")),
+        _aissd_q_drift_log_value(cos_stats.get("reqmax_p95")),
+        _aissd_q_drift_log_value(cos_stats.get("reqmax_max")),
+        _aissd_q_drift_log_value(cos_stats.get("req_exceed_ratio")),
+        cos_stats.get("worst_req", "NA"),
+        cos_stats.get("worst_head", "NA"),
+        _aissd_q_drift_rel_l2_threshold(),
+        _aissd_q_drift_log_value(rel_decision),
+        _aissd_q_drift_log_value(rel_stats.get("mean")),
+        _aissd_q_drift_log_value(rel_stats.get("p50")),
+        _aissd_q_drift_log_value(rel_stats.get("p90")),
+        _aissd_q_drift_log_value(rel_stats.get("p95")),
+        _aissd_q_drift_log_value(rel_stats.get("p99")),
+        _aissd_q_drift_log_value(rel_value),
+        _aissd_q_drift_log_value(rel_stats.get("exceed_ratio")),
+        _aissd_q_drift_log_value(rel_stats.get("reqmax_mean")),
+        _aissd_q_drift_log_value(rel_stats.get("reqmax_p50")),
+        _aissd_q_drift_log_value(rel_stats.get("reqmax_p95")),
+        _aissd_q_drift_log_value(rel_stats.get("reqmax_max")),
+        _aissd_q_drift_log_value(rel_stats.get("req_exceed_ratio")),
+        rel_stats.get("worst_req", "NA"),
+        rel_stats.get("worst_head", "NA"),
+        check_ms,
+    )
 
 
 def _aissd_token_reuse_virtual_step(
@@ -430,6 +767,11 @@ def _aissd_token_reuse_allows(
     entry: dict[str, Any],
     token_state: dict[str, Any],
     strategy: str | None = None,
+    *,
+    current_q: torch.Tensor | None = None,
+    candidate_signature: tuple[int, ...] = (),
+    evaluate_q_drift: bool = True,
+    step_context: dict[str, Any] | None = None,
 ) -> tuple[bool, str]:
     if strategy is None:
         strategy = _aissd_token_reuse_strategy()
@@ -446,6 +788,91 @@ def _aissd_token_reuse_allows(
     delta = cur_step - entry_step
     if delta < 0:
         return False, "token_step_rewind"
+
+    if _aissd_token_reuse_is_q_drift(strategy):
+        # S layers never compare their Q with an F-layer anchor. They may consume
+        # the source F layer only after that F layer resolved this token step.
+        if not evaluate_q_drift:
+            if int(entry.get("resolved_token_step", -999999)) == cur_step:
+                return True, "q_drift_source_resolved"
+            return False, "q_drift_source_not_resolved"
+
+        if step_context is not None:
+            step_context["aissd_q_drift_cos_max"] = None
+            step_context["aissd_q_drift_rel_l2_max"] = None
+            step_context["aissd_q_drift_cos_decision"] = None
+            step_context["aissd_q_drift_rel_l2_decision"] = None
+            step_context["aissd_q_drift_decision_reduce"] = _aissd_q_drift_reduce()
+            step_context["aissd_q_drift_distribution"] = None
+            step_context["aissd_q_drift_check_ms"] = 0.0
+            step_context["aissd_q_drift_anchor_step"] = entry.get("anchor_token_step")
+            step_context["aissd_q_drift_anchor_age"] = None
+            step_context["aissd_q_drift_candidate_same"] = None
+
+        anchor_step = int(entry.get("anchor_token_step", entry_step))
+        age = cur_step - anchor_step
+        if step_context is not None:
+            step_context["aissd_q_drift_anchor_step"] = anchor_step
+            step_context["aissd_q_drift_anchor_age"] = age
+        if age < 0:
+            return False, "q_drift_anchor_step_rewind"
+        if age >= _aissd_q_drift_max_staleness():
+            return False, "q_drift_max_staleness"
+
+        cached_signature = tuple(entry.get("candidate_signature", ()))
+        current_signature = tuple(candidate_signature)
+        candidate_same = bool(cached_signature) and cached_signature == current_signature
+        if step_context is not None:
+            step_context["aissd_q_drift_candidate_same"] = candidate_same
+        if not cached_signature:
+            return False, "q_drift_candidate_signature_missing"
+        if not current_signature:
+            return False, "q_drift_current_candidate_signature_missing"
+        if not candidate_same:
+            return False, "q_drift_candidate_changed"
+
+        anchor_q = entry.get("anchor_q")
+        if not isinstance(anchor_q, torch.Tensor):
+            return False, "q_drift_anchor_q_missing"
+        if not isinstance(current_q, torch.Tensor):
+            return False, "q_drift_current_q_missing"
+        if tuple(anchor_q.shape) != tuple(current_q.shape):
+            return False, "q_drift_q_shape_changed"
+
+        drift_t0 = time.perf_counter()
+        collect_distribution = _aissd_token_reuse_overhead_log_enabled()
+        (
+            cos_decision,
+            rel_l2_decision,
+            cos_max,
+            rel_l2_max,
+            distribution,
+        ) = _aissd_compute_q_drift(
+            current_q,
+            anchor_q,
+            collect_distribution=collect_distribution,
+        )
+        drift_ms = (time.perf_counter() - drift_t0) * 1000.0
+        decision_reduce = _aissd_q_drift_reduce()
+        if step_context is not None:
+            step_context["aissd_q_drift_cos_max"] = float(cos_max)
+            step_context["aissd_q_drift_rel_l2_max"] = float(rel_l2_max)
+            step_context["aissd_q_drift_cos_decision"] = float(cos_decision)
+            step_context["aissd_q_drift_rel_l2_decision"] = float(rel_l2_decision)
+            step_context["aissd_q_drift_decision_reduce"] = decision_reduce
+            step_context["aissd_q_drift_distribution"] = distribution
+            step_context["aissd_q_drift_check_ms"] = float(drift_ms)
+        if cos_decision > _aissd_q_drift_cos_threshold():
+            return False, "q_drift_cos_threshold"
+        if rel_l2_decision > _aissd_q_drift_rel_l2_threshold():
+            return False, "q_drift_rel_l2_threshold"
+        entry["resolved_token_step"] = cur_step
+        entry["last_q_decision_reduce"] = decision_reduce
+        entry["last_q_cos_drift"] = float(cos_decision)
+        entry["last_q_rel_l2_drift"] = float(rel_l2_decision)
+        entry["last_q_cos_max"] = float(cos_max)
+        entry["last_q_rel_l2_max"] = float(rel_l2_max)
+        return True, "q_drift_safe"
 
     if strategy in ("none", "off", "every_token", "per_token"):
         if delta == 0:
@@ -498,6 +925,7 @@ _AISSD_CANDIDATE_LAYER_KEYS = (
     ("aissd_candidate_extent_count", "aissd_layer_candidate_extent_count"),
     ("aissd_candidate_extent_lba", "aissd_layer_candidate_extent_lba"),
     ("aissd_candidate_extent_bytes", "aissd_layer_candidate_extent_bytes"),
+    ("aissd_candidate_signature", "aissd_layer_candidate_signature"),
 )
 
 
@@ -568,6 +996,9 @@ def _aissd_cache_selected_metadata(
     generation: int,
     token_state: dict[str, Any],
     strategy: str | None = None,
+    *,
+    current_q: torch.Tensor | None = None,
+    candidate_signature: tuple[int, ...] = (),
 ) -> None:
     if strategy is None:
         strategy = _aissd_token_reuse_strategy()
@@ -576,10 +1007,31 @@ def _aissd_cache_selected_metadata(
         "source_layer_id": int(source_layer_id),
         "source_layer_name": str(source_layer_name),
         "token_step": int(token_state["token_step"]),
+        "resolved_token_step": int(token_state["token_step"]),
         "active_sig": tuple(token_state.get("active_sig", ())),
         "token_sig": tuple(token_state.get("token_sig", ())),
         "token_reuse_strategy": strategy,
     }
+    if _aissd_token_reuse_is_q_drift(strategy):
+        if not isinstance(current_q, torch.Tensor):
+            raise RuntimeError(
+                "AISSD q_drift selector refresh cannot cache metadata without "
+                f"the current F-layer Q, layer={source_layer_name}"
+            )
+        if not candidate_signature:
+            raise RuntimeError(
+                "AISSD q_drift selector refresh cannot cache metadata without "
+                f"a candidate signature, layer={source_layer_name}"
+            )
+        entry["anchor_q"] = current_q.detach().clone()
+        entry["anchor_token_step"] = int(token_state["token_step"])
+        entry["candidate_signature"] = tuple(candidate_signature)
+        step_context["aissd_q_drift_anchor_copy_bytes"] = (
+            int(current_q.numel()) * int(current_q.element_size())
+        )
+    else:
+        step_context["aissd_q_drift_anchor_copy_bytes"] = 0
+
     copy_bytes = 0
     for key in _AISSD_SELECTED_METADATA_KEYS:
         tensor = step_context.get(key)
@@ -624,6 +1076,10 @@ def _aissd_restore_selected_metadata(
     generation: int,
     token_state: dict[str, Any],
     strategy: str | None = None,
+    *,
+    current_q: torch.Tensor | None = None,
+    candidate_signature: tuple[int, ...] = (),
+    evaluate_q_drift: bool = True,
 ) -> bool:
     if strategy is None:
         strategy = _aissd_token_reuse_strategy()
@@ -633,8 +1089,24 @@ def _aissd_restore_selected_metadata(
     entry = _aissd_selected_cache(step_context).get(int(source_layer_id))
     if not isinstance(entry, dict):
         step_context["aissd_token_reuse_last_reason"] = "missing_cache_entry"
+        if _aissd_token_reuse_is_q_drift(strategy):
+            step_context["aissd_q_drift_cos_max"] = None
+            step_context["aissd_q_drift_rel_l2_max"] = None
+            step_context["aissd_q_drift_distribution"] = None
+            step_context["aissd_q_drift_check_ms"] = 0.0
+            step_context["aissd_q_drift_anchor_step"] = None
+            step_context["aissd_q_drift_anchor_age"] = None
+            step_context["aissd_q_drift_candidate_same"] = None
         return False
-    allowed, reason = _aissd_token_reuse_allows(entry, token_state, strategy)
+    allowed, reason = _aissd_token_reuse_allows(
+        entry,
+        token_state,
+        strategy,
+        current_q=current_q,
+        candidate_signature=candidate_signature,
+        evaluate_q_drift=evaluate_q_drift,
+        step_context=step_context,
+    )
     step_context["aissd_token_reuse_last_reason"] = reason
     step_context["aissd_token_reuse_cached_token_step"] = entry.get("token_step")
     if not allowed:
@@ -739,22 +1211,63 @@ def _maybe_run_aissd_selector_op(
     token_reuse_strategy = _aissd_token_reuse_strategy()
     overhead_log_enabled = _aissd_token_reuse_overhead_log_enabled()
     layer_id = _aissd_parse_layer_id(layer_name, step_context)
+    layer_reuse_enabled = _aissd_layer_reuse_enabled()
+    layer_reuse_strategy = _aissd_layer_reuse_strategy()
+    if _aissd_token_reuse_is_q_drift(token_reuse_strategy) and (
+        not layer_reuse_enabled or layer_reuse_strategy != "static"
+    ):
+        raise RuntimeError(
+            "AISSD_TOKEN_REUSE_STRATEGY=q_drift currently requires "
+            "AISSD_SPARSE_KV_LAYER_REUSE=1 and "
+            "AISSD_LAYER_REUSE_STRATEGY=static"
+        )
+
     token_state_t0 = time.perf_counter()
     token_state = _aissd_token_reuse_state(
         step_context, generation, layer_id, token_reuse_strategy
     )
     token_state_ms = (time.perf_counter() - token_state_t0) * 1000.0
-    if _aissd_layer_reuse_enabled():
+    q_drift_query: torch.Tensor | None = None
+    candidate_signature: tuple[int, ...] = ()
+
+    if layer_reuse_enabled:
         done_generation = int(
             step_context.get("aissd_selector_done_generation", -999999) or -999999
         )
         done_layer_id = int(
             step_context.get("aissd_selector_done_layer_id", -999999) or -999999
         )
-        strategy = _aissd_layer_reuse_strategy()
+        strategy = layer_reuse_strategy
         if strategy == "static":
             f_layers = _aissd_static_f_layers()
+            is_f_layer = int(layer_id) in f_layers
             source_layer_id = _aissd_static_reuse_source_layer_id(layer_id, f_layers)
+
+            if _aissd_token_reuse_is_q_drift(token_reuse_strategy) and is_f_layer:
+                # Activate this F layer's candidate metadata before comparing its
+                # signature with the signature cached at the previous selector.
+                _aissd_select_candidate_tensors_for_layer(step_context, layer_id)
+                candidate_signature = _aissd_current_candidate_signature(step_context)
+                q_drift_query = _aissd_q_drift_query_view(
+                    query,
+                    host_active_reqs,
+                    int(num_heads),
+                    int(head_size),
+                )
+                if q_drift_query is None:
+                    raise RuntimeError(
+                        "AISSD q_drift could not reshape the current F-layer Q to "
+                        f"[active_reqs, num_heads, head_size]: layer={layer_name} "
+                        f"q_shape={tuple(query.shape)} active_reqs={host_active_reqs} "
+                        f"num_heads={num_heads} head_size={head_size}"
+                    )
+                if not candidate_signature:
+                    raise RuntimeError(
+                        "AISSD q_drift requires candidate signatures from "
+                        "prepare_sparse_kv_step(); update vllm_v1_adapter.py and "
+                        f"verify layer={layer_name}"
+                    )
+
             restore_t0 = time.perf_counter()
             restored = _aissd_restore_selected_metadata(
                 step_context,
@@ -762,14 +1275,32 @@ def _maybe_run_aissd_selector_op(
                 generation,
                 token_state,
                 token_reuse_strategy,
+                current_q=q_drift_query,
+                candidate_signature=candidate_signature,
+                evaluate_q_drift=(
+                    _aissd_token_reuse_is_q_drift(token_reuse_strategy)
+                    and is_f_layer
+                ),
             )
             restore_ms = (time.perf_counter() - restore_t0) * 1000.0
+            if (
+                _aissd_token_reuse_is_q_drift(token_reuse_strategy)
+                and is_f_layer
+            ):
+                _aissd_log_q_drift_decision(
+                    step_context=step_context,
+                    layer_name=layer_name,
+                    layer_id=layer_id,
+                    token_state=token_state,
+                    restored=restored,
+                )
             if overhead_log_enabled:
                 logger.info(
                     "[aissd-token-reuse-overhead] op=restore layer=%s layer_id=%s "
                     "generation=%s strategy=%s source_layer_id=%s hit=%s "
                     "state_ms=%.6f restore_ms=%.6f copy_count=%s copy_bytes=%s "
-                    "skip_active=%s token_step=%s cached_token_step=%s reason=%s",
+                    "skip_active=%s token_step=%s cached_token_step=%s reason=%s "
+                    "q_drift_check_ms=%s",
                     layer_name,
                     layer_id,
                     generation,
@@ -784,6 +1315,7 @@ def _maybe_run_aissd_selector_op(
                     token_state.get("token_step"),
                     step_context.get("aissd_token_reuse_cached_token_step"),
                     step_context.get("aissd_token_reuse_last_reason"),
+                    step_context.get("aissd_q_drift_check_ms", 0.0),
                 )
             if restored:
                 if _aissd_selector_stats_enabled() or _sparse_kv_debug_enabled():
@@ -818,7 +1350,7 @@ def _maybe_run_aissd_selector_op(
                 )
                 step_context["aissd_selector_real_layer_id"] = source_layer_id
                 return 0.0
-            if layer_id not in f_layers:
+            if not is_f_layer:
                 raise RuntimeError(
                     "AISSD static reuse metadata is not ready for non-F layer "
                     f"layer={layer_name} layer_id={layer_id} source_layer_id={source_layer_id} "
@@ -826,7 +1358,8 @@ def _maybe_run_aissd_selector_op(
                     "from its nearest previous F layer; it must not fallback to running "
                     "a selector."
                 )
-            _aissd_select_candidate_tensors_for_layer(step_context, layer_id)
+            if not _aissd_token_reuse_is_q_drift(token_reuse_strategy):
+                _aissd_select_candidate_tensors_for_layer(step_context, layer_id)
             if _aissd_selector_stats_enabled() or _sparse_kv_debug_enabled():
                 logger.info(
                     "[aissd-selector-op] run layer=%s layer_id=%s generation=%s "
@@ -941,6 +1474,8 @@ def _maybe_run_aissd_selector_op(
             generation,
             token_state,
             token_reuse_strategy,
+            current_q=q_drift_query,
+            candidate_signature=candidate_signature,
         )
         cache_ms = (time.perf_counter() - cache_t0) * 1000.0
         if overhead_log_enabled:
