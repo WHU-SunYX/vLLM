@@ -1392,6 +1392,27 @@ def _maybe_run_aissd_selector_op(
             step_context["aissd_selector_real_layer"] = step_context.get("aissd_selector_done_layer")
             step_context["aissd_selector_real_layer_id"] = step_context.get("aissd_selector_done_layer_id")
             return 0.0
+    else:
+        # AISSD_SPARSE_KV_LAYER_REUSE=0 is the hard off switch for layer reuse.
+        # In this mode each attention layer must run its own selector using that
+        # layer's prepared candidate/qkpack metadata.  Do not fall back to the
+        # legacy non-layered aliases, because those aliases point at candidate
+        # layer position 0 in the layered step context.
+        _aissd_select_candidate_tensors_for_layer(step_context, layer_id)
+        step_context["aissd_selector_reuse_strategy"] = "none"
+        step_context["aissd_selector_reuse_source_layer_id"] = int(layer_id)
+        if _aissd_selector_stats_enabled() or _sparse_kv_debug_enabled():
+            logger.info(
+                "[aissd-selector-op] run layer=%s layer_id=%s generation=%s "
+                "strategy=none candidate_layer_id=%s token_reuse_strategy=%s "
+                "token_step=%s",
+                layer_name,
+                layer_id,
+                generation,
+                step_context.get("aissd_candidate_active_layer_id"),
+                token_reuse_strategy,
+                token_state.get("token_step"),
+            )
 
     required = (
         "aissd_candidate_count",
@@ -1465,7 +1486,7 @@ def _maybe_run_aissd_selector_op(
         int(step_context.get("aissd_manifest_block_size", 4096)),
         int(step_context.get("aissd_timeout_ms", 300000)),
     )
-    if _aissd_layer_reuse_enabled() and _aissd_layer_reuse_strategy() == "static":
+    if layer_reuse_enabled and layer_reuse_strategy == "static":
         cache_t0 = time.perf_counter()
         _aissd_cache_selected_metadata(
             step_context,
@@ -1498,14 +1519,16 @@ def _maybe_run_aissd_selector_op(
     step_context["aissd_selector_ms"] = float(elapsed_ms)
     step_context["aissd_selector_reused"] = False
     step_context["aissd_selector_reuse_strategy"] = (
-        _aissd_layer_reuse_strategy() if _aissd_layer_reuse_enabled() else "none"
+        layer_reuse_strategy if layer_reuse_enabled else "none"
     )
     step_context["aissd_selector_reuse_source_layer_id"] = int(layer_id)
     step_context["aissd_selector_token_reuse_strategy"] = token_reuse_strategy
     step_context["aissd_selector_token_step"] = int(token_state["token_step"])
     step_context["aissd_selector_token_reuse_reason"] = "selector_refreshed"
-    if _aissd_layer_reuse_strategy() == "static":
+    if layer_reuse_enabled and layer_reuse_strategy == "static":
         step_context["aissd_selector_f_layers"] = _aissd_static_f_layers()
+    else:
+        step_context["aissd_selector_f_layers"] = ()
     step_context["aissd_selector_real_layer"] = str(layer_name)
     step_context["aissd_selector_real_layer_id"] = int(layer_id)
     step_context["aissd_selector_real_generation"] = int(generation)
@@ -1528,12 +1551,12 @@ def _maybe_run_aissd_selector_op(
             step_context.get("host_active_reqs"),
             step_context.get("aissd_candidate_count"),
             step_context.get("top_n_chunks"),
-            _aissd_layer_reuse_enabled(),
+            layer_reuse_enabled,
             step_context.get("aissd_selector_reuse_strategy"),
             step_context.get("aissd_selector_token_reuse_strategy"),
             step_context.get("aissd_selector_token_step"),
             ",".join(str(x) for x in _aissd_static_f_layers())
-            if _aissd_layer_reuse_strategy() == "static"
+            if layer_reuse_enabled and layer_reuse_strategy == "static"
             else "",
         )
 
