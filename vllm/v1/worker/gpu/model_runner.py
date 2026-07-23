@@ -430,12 +430,10 @@ class GPUModelRunner(LoRAModelRunnerMixin):
                 ) + spec.num_speculative_blocks
             max_num_blocks_per_group.append(max_num_blocks)
 
-        # Current vLLM V2 GPU attn_utils.init_attn_backend() returns
-        # exactly four values:
-        #   attn_backends, attn_groups, attn_cg_support, kernel_block_sizes
-        # Keep the full contract instead of guessing/ignoring by type.
-        self.attn_backends, self.attn_groups, attn_cg_support, kernel_block_sizes = (
-            init_attn_backend(self.kv_cache_config, self.vllm_config, self.device)
+        # attn_utils.init_attn_backend() returns:
+        #   attn_groups, attn_cg_support, kernel_block_sizes
+        self.attn_groups, attn_cg_support, kernel_block_sizes = init_attn_backend(
+            self.kv_cache_config, self.vllm_config, self.device
         )
         self.block_tables = BlockTables(
             block_sizes=block_sizes,
@@ -476,18 +474,13 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             )
 
         self.kv_caches: list[torch.Tensor] = []
-        # Current V2 attn_utils.init_kv_cache() expects the
-        # per-layer attention backend map returned by init_attn_backend().
-        # Contract verified from runtime introspection:
-        #   init_attn_backend() ->
-        #       attn_backends, attn_groups, attn_cg_support, kernel_block_sizes
-        #   init_kv_cache(..., attn_backends, device, cache_dtype,
-        #                 kernel_block_sizes, vllm_config)
+        # init_kv_cache() expects the attention groups returned by
+        # init_attn_backend().
         kv_caches_dict = init_kv_cache(
             self.kv_caches,
             self.compilation_config.static_forward_context,
             self.kv_cache_config,
-            self.attn_backends,
+            self.attn_groups,
             self.device,
             self.cache_config.cache_dtype,
             kernel_block_sizes,
