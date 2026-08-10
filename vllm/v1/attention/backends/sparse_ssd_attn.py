@@ -953,6 +953,20 @@ def _aissd_candidate_layer_ids(step_context: dict[str, Any]) -> list[int]:
     return []
 
 
+def _aissd_effective_f_layers(step_context: dict[str, Any]) -> tuple[int, ...]:
+    """Return the request-scoped F-layer layout for the current model step.
+
+    prepare_sparse_kv_step() publishes candidate metadata only for the F layers
+    selected by the request-scoped IndexCache policy.  That runtime layout is
+    authoritative for dynamic greedy-search candidates and must take precedence
+    over the process-wide AISSD_F_LAYERS fallback.
+    """
+    runtime_layers = _aissd_candidate_layer_ids(step_context)
+    if runtime_layers:
+        return tuple(sorted(set(int(x) for x in runtime_layers)))
+    return _aissd_static_f_layers()
+
+
 def _aissd_select_candidate_tensors_for_layer(
     step_context: dict[str, Any],
     layer_id: int,
@@ -1239,7 +1253,11 @@ def _maybe_run_aissd_selector_op(
         )
         strategy = layer_reuse_strategy
         if strategy == "static":
-            f_layers = _aissd_static_f_layers()
+            # The request-scoped IndexCache policy may differ for every
+            # evaluation candidate.  Use the F-layer ids published by
+            # prepare_sparse_kv_step() instead of the process-wide environment
+            # fallback, otherwise an S layer can be misclassified as F.
+            f_layers = _aissd_effective_f_layers(step_context)
             is_f_layer = int(layer_id) in f_layers
             source_layer_id = _aissd_static_reuse_source_layer_id(layer_id, f_layers)
 
@@ -1526,7 +1544,9 @@ def _maybe_run_aissd_selector_op(
     step_context["aissd_selector_token_step"] = int(token_state["token_step"])
     step_context["aissd_selector_token_reuse_reason"] = "selector_refreshed"
     if layer_reuse_enabled and layer_reuse_strategy == "static":
-        step_context["aissd_selector_f_layers"] = _aissd_static_f_layers()
+        step_context["aissd_selector_f_layers"] = _aissd_effective_f_layers(
+            step_context
+        )
     else:
         step_context["aissd_selector_f_layers"] = ()
     step_context["aissd_selector_real_layer"] = str(layer_name)
@@ -1555,7 +1575,9 @@ def _maybe_run_aissd_selector_op(
             step_context.get("aissd_selector_reuse_strategy"),
             step_context.get("aissd_selector_token_reuse_strategy"),
             step_context.get("aissd_selector_token_step"),
-            ",".join(str(x) for x in _aissd_static_f_layers())
+            ",".join(
+                str(x) for x in _aissd_effective_f_layers(step_context)
+            )
             if layer_reuse_enabled and layer_reuse_strategy == "static"
             else "",
         )

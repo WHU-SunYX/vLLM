@@ -4,6 +4,7 @@
 import functools
 import gc
 import itertools
+import os
 import threading
 import time
 from collections import defaultdict
@@ -226,6 +227,53 @@ if TYPE_CHECKING:
     from vllm.v1.worker.encoder_cudagraph import EncoderCudaGraphManager
 
 logger = init_logger(__name__)
+
+
+def _aissd_sparse_kv_step_eager_enabled(
+    vllm_config: VllmConfig,
+) -> tuple[bool, str]:
+    """Return whether real AISSD sparse-KV steps should skip CUDA graph replay.
+
+    This is intentionally a per-step dispatch decision, not a global mutation of
+    compilation_config. Capture/warmup can stay enabled; only real steps that
+    need the HOST/SSD selector are dispatched with CUDAGraphMode.NONE so the
+    Python/C++ bridge is re-entered with the real Q tensor.
+    """
+    if os.environ.get("AISSD_SPARSE_KV_ALLOW_CUDAGRAPH", "0").lower() in (
+        "1",
+        "true",
+        "yes",
+        "on",
+    ):
+        return False, "allow_cudagraph_override"
+    if os.environ.get("AISSD_SPARSE_KV_STEP_EAGER", "1").lower() in (
+        "0",
+        "false",
+        "no",
+        "off",
+    ):
+        return False, "step_eager_disabled"
+
+    kv_transfer_config = getattr(vllm_config, "kv_transfer_config", None)
+    extra_config = (
+        getattr(kv_transfer_config, "kv_connector_extra_config", None) or {}
+    )
+
+    def _cfg_bool(key: str, default: bool = False) -> bool:
+        value = extra_config.get(key, default)
+        if isinstance(value, bool):
+            return value
+        if isinstance(value, str):
+            return value.lower() in ("1", "true", "yes", "on")
+        return bool(value)
+
+    enabled = _cfg_bool("lmcache.enable_sparse_kv_cache", False)
+    sparse_attention = _cfg_bool("lmcache.enable_sparse_attention", False)
+    backend = str(extra_config.get("lmcache.sparse_kv_backend", "")).lower()
+    if enabled and sparse_attention and backend in ("ssd-cpu", "ssd-npu"):
+        return True, backend
+    return False, "not_aissd_sparse_backend"
+
 
 AttnMetadataDict: TypeAlias = dict[str, AttentionMetadata]
 # list when ubatching is enabled
@@ -4051,6 +4099,23 @@ class GPUModelRunner(
                     scheduler_output.num_common_prefix_blocks,
                 )
 
+            # AISSD sparse selector must run outside CUDA graph replay for real
+            # request steps. Keep global graph capture enabled; only dispatch this
+            # step with CUDAGraphMode.NONE when sparse-KV selector can be active.
+            aissd_step_eager, aissd_step_reason = (
+                _aissd_sparse_kv_step_eager_enabled(self.vllm_config)
+            )
+            if aissd_step_eager and not getattr(
+                self, "_aissd_step_eager_logged", False
+            ):
+                logger.warning(
+                    "[warning][aissd-selector-step-eager] backend=%s "
+                    "reason=dispatch this real AISSD step with "
+                    "CUDAGraphMode.NONE; global CUDA graph capture remains enabled",
+                    aissd_step_reason,
+                )
+                self._aissd_step_eager_logged = True
+
             (
                 cudagraph_mode,
                 batch_desc,
@@ -4063,6 +4128,7 @@ class GPUModelRunner(
                 num_scheduled_tokens_np=num_scheduled_tokens_np,
                 max_num_scheduled_tokens=max_num_scheduled_tokens,
                 use_cascade_attn=cascade_attn_prefix_lens is not None,
+                force_eager=aissd_step_eager,
                 num_encoder_reqs=len(scheduler_output.scheduled_encoder_inputs),
             )
 
