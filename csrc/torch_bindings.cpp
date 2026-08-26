@@ -100,7 +100,8 @@ TORCH_LIBRARY_EXPAND(TORCH_EXTENSION_NAME, ops) {
       "Tensor aissd_candidate_extent_lba, Tensor aissd_candidate_extent_bytes, "
       "Tensor(a!) selected_block_table, Tensor(b!) selected_block_lens, "
       "Tensor(c!) selected_ready_flags, Tensor(d!) fa_block_table, "
-      "Tensor(e!) fa_seq_lens, int layer_id, int backend, int num_q_heads, "
+      "Tensor(e!) fa_seq_lens, Tensor(f!) aissd_rpc_selected_chunk_ids, "
+      "Tensor(g!) aissd_rpc_selected_chunk_lens, int layer_id, int backend, int num_q_heads, "
       "int num_kv_heads, int head_dim, int chunk_size, int block_size, "
       "int top_n_chunks, int top_m, int score_mode, int manifest_block_size, "
       "int timeout_ms) -> ()");

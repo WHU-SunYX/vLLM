@@ -52,6 +52,8 @@ void aissd_sparse_kv_select(
     at::Tensor& selected_ready_flags,
     at::Tensor& fa_block_table,
     at::Tensor& fa_seq_lens,
+    at::Tensor& aissd_rpc_selected_chunk_ids,
+    at::Tensor& aissd_rpc_selected_chunk_lens,
     int64_t layer_id,
     int64_t backend,
     int64_t num_q_heads,

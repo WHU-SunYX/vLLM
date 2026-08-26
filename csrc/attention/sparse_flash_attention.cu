@@ -13,9 +13,11 @@
 #include <cuda.h>
 #include <cuda_runtime.h>
 
+#include <algorithm>
 #include <cfloat>
 #include <cmath>
 #include <cstdint>
+#include <cstdio>
 #include <cstring>
 #include <cstdlib>
 #include <dlfcn.h>
@@ -656,6 +658,101 @@ void ensure_not_cuda_graph_capturing(cudaStream_t stream) {
   }
 }
 
+bool aissd_env_truthy(const char* name) {
+  const char* v = std::getenv(name);
+  if (!v || !v[0]) return false;
+  return std::strcmp(v, "0") != 0 &&
+         std::strcmp(v, "false") != 0 &&
+         std::strcmp(v, "False") != 0 &&
+         std::strcmp(v, "no") != 0 &&
+         std::strcmp(v, "off") != 0;
+}
+
+uint32_t aissd_env_u32(const char* name, uint32_t fallback) {
+  const char* v = std::getenv(name);
+  if (!v || !v[0]) return fallback;
+  char* endp = nullptr;
+  const unsigned long x = std::strtoul(v, &endp, 0);
+  if (endp == v) return fallback;
+  return x > UINT32_MAX ? UINT32_MAX : static_cast<uint32_t>(x);
+}
+
+uint64_t aissd_fnv1a64(const void* data, size_t bytes) {
+  const auto* p = static_cast<const uint8_t*>(data);
+  uint64_t h = 1469598103934665603ULL;
+  for (size_t i = 0; i < bytes; ++i) {
+    h ^= static_cast<uint64_t>(p[i]);
+    h *= 1099511628211ULL;
+  }
+  return h;
+}
+
+bool aissd_q_trace_reserve(int64_t layer_id, uint64_t* seq_out) {
+  if (!aissd_env_truthy("AISSD_SPARSE_KV_Q_TRACE")) return false;
+  const uint32_t layer_filter =
+      aissd_env_u32("AISSD_SPARSE_KV_Q_TRACE_LAYER", 0u);
+  if (layer_filter != UINT32_MAX &&
+      layer_id != static_cast<int64_t>(layer_filter)) {
+    return false;
+  }
+  static unsigned long long match_calls = 0;
+  const unsigned long long seq =
+      __sync_add_and_fetch(&match_calls, 1ULL);
+  const uint32_t max_calls =
+      aissd_env_u32("AISSD_SPARSE_KV_Q_TRACE_MAX_CALLS", 2u);
+  if (max_calls != 0u && seq > static_cast<unsigned long long>(max_calls)) {
+    return false;
+  }
+  if (seq_out) *seq_out = static_cast<uint64_t>(seq);
+  return true;
+}
+
+void aissd_q_trace_dump(const char* stage,
+                        const void* data,
+                        size_t bytes,
+                        uint32_t q_dtype,
+                        int64_t layer_id,
+                        uint64_t job_id,
+                        uint64_t request_id,
+                        uint64_t seq) {
+  if (!data || bytes == 0) return;
+  const auto* p = static_cast<const uint8_t*>(data);
+  const size_t words = bytes / sizeof(uint16_t);
+  size_t zero_u16 = 0;
+  for (size_t i = 0; i < words; ++i) {
+    uint16_t w = 0;
+    std::memcpy(&w, p + i * sizeof(uint16_t), sizeof(w));
+    if (w == 0) ++zero_u16;
+  }
+
+  const uint32_t show_cfg =
+      aissd_env_u32("AISSD_SPARSE_KV_Q_TRACE_SHOW_U16", 16u);
+  const size_t show = std::min<size_t>(words, show_cfg);
+
+  std::fprintf(stderr,
+               "[aissd-q-trace][%s] seq=%llu layer=%lld job_id=%llu "
+               "request_id=%llu q_dtype=%u bytes=%zu fnv1a64=0x%016llx "
+               "u16_words=%zu zero_u16=%zu first_u16=",
+               stage ? stage : "unknown",
+               static_cast<unsigned long long>(seq),
+               static_cast<long long>(layer_id),
+               static_cast<unsigned long long>(job_id),
+               static_cast<unsigned long long>(request_id),
+               q_dtype,
+               bytes,
+               static_cast<unsigned long long>(aissd_fnv1a64(data, bytes)),
+               words,
+               zero_u16);
+  for (size_t i = 0; i < show; ++i) {
+    uint16_t w = 0;
+    std::memcpy(&w, p + i * sizeof(uint16_t), sizeof(w));
+    std::fprintf(stderr, "%s0x%04x", i ? "," : "[",
+                 static_cast<unsigned int>(w));
+  }
+  std::fprintf(stderr, "]\n");
+  std::fflush(stderr);
+}
+
 }  // namespace
 
 void aissd_sparse_kv_select(
@@ -681,6 +778,8 @@ void aissd_sparse_kv_select(
     at::Tensor& selected_ready_flags,
     at::Tensor& fa_block_table,
     at::Tensor& fa_seq_lens,
+    at::Tensor& aissd_rpc_selected_chunk_ids,
+    at::Tensor& aissd_rpc_selected_chunk_lens,
     int64_t layer_id,
     int64_t backend,
     int64_t num_q_heads,
@@ -708,6 +807,32 @@ void aissd_sparse_kv_select(
   TORCH_CHECK(selected_block_lens.numel() == fa_seq_lens.numel(),
               "aissd_sparse_kv_select: fa_seq_lens length must match selected_block_lens");
 
+  // Preserve the SSD RPC result itself for Phase-1 quality tracing. Do not
+  // infer selected chunks back from selected_block_table: block IDs are an
+  // attention representation and can be ambiguous/reindexed independently of
+  // the SSD selector's chunk IDs.
+  TORCH_CHECK(!aissd_rpc_selected_chunk_ids.is_cuda() &&
+                  !aissd_rpc_selected_chunk_lens.is_cuda(),
+              "aissd_sparse_kv_select: RPC selected chunk outputs must be CPU tensors");
+  TORCH_CHECK(aissd_rpc_selected_chunk_ids.scalar_type() == at::kInt &&
+                  aissd_rpc_selected_chunk_lens.scalar_type() == at::kInt,
+              "aissd_sparse_kv_select: RPC selected chunk outputs must be int32");
+  TORCH_CHECK(aissd_rpc_selected_chunk_ids.dim() == 2 &&
+                  aissd_rpc_selected_chunk_lens.dim() == 1 &&
+                  aissd_rpc_selected_chunk_ids.size(0) ==
+                      aissd_rpc_selected_chunk_lens.size(0),
+              "aissd_sparse_kv_select: RPC selected chunk output shape mismatch");
+  TORCH_CHECK(aissd_rpc_selected_chunk_ids.is_contiguous() &&
+                  aissd_rpc_selected_chunk_lens.is_contiguous(),
+              "aissd_sparse_kv_select: RPC selected chunk outputs must be contiguous");
+
+  auto* rpc_selected_ids = aissd_rpc_selected_chunk_ids.data_ptr<int32_t>();
+  auto* rpc_selected_lens = aissd_rpc_selected_chunk_lens.data_ptr<int32_t>();
+  std::fill(rpc_selected_ids,
+            rpc_selected_ids + aissd_rpc_selected_chunk_ids.numel(), -1);
+  std::fill(rpc_selected_lens,
+            rpc_selected_lens + aissd_rpc_selected_chunk_lens.numel(), 0);
+
   const c10::cuda::CUDAGuard guard(query.device());
   cudaStream_t stream = at::cuda::getCurrentCUDAStream();
   ensure_not_cuda_graph_capturing(stream);
@@ -719,6 +844,8 @@ void aissd_sparse_kv_select(
   }
   TORCH_CHECK(reqs <= selected_block_table.size(0),
               "aissd_sparse_kv_select: active_reqs exceeds metadata rows");
+  TORCH_CHECK(reqs <= aissd_rpc_selected_chunk_ids.size(0),
+              "aissd_sparse_kv_select: active_reqs exceeds RPC selected chunk rows");
 
   // Materialize CPU metadata. LMCache normally prepares these on CPU; .cpu()
   // also keeps the call robust if a future path publishes pinned/CUDA tensors.
@@ -820,11 +947,33 @@ void aissd_sparse_kv_select(
       dst.nbytes = nbytes;
     }
 
+    uint64_t q_trace_seq = 0;
+    if (aissd_q_trace_reserve(layer_id, &q_trace_seq)) {
+      aissd_q_trace_dump("HOST-D2H-BEFORE-RPC",
+                         q_host.data(),
+                         static_cast<size_t>(q_bytes),
+                         q_dtype,
+                         layer_id,
+                         req.job_id,
+                         req.request_id,
+                         q_trace_seq);
+    }
+
     const int rc = api.run(q_host.data(), static_cast<uint32_t>(q_bytes), &req, &resp,
                            static_cast<int>(timeout_ms));
     TORCH_CHECK(rc == 0 && resp.status == 0,
                 "aissd_sparse_kv_run_native_extents failed rc=", rc,
                 " status=", resp.status, " error_code=", resp.error_code);
+
+    const int64_t rpc_capacity = aissd_rpc_selected_chunk_ids.size(1);
+    TORCH_CHECK(static_cast<int64_t>(resp.selected_chunk_count) <= rpc_capacity,
+                "aissd_sparse_kv_select: SSD returned selected_chunk_count=",
+                resp.selected_chunk_count, " larger than trace capacity=", rpc_capacity);
+    rpc_selected_lens[r] = static_cast<int32_t>(resp.selected_chunk_count);
+    for (uint32_t si = 0; si < resp.selected_chunk_count; ++si) {
+      rpc_selected_ids[r * rpc_capacity + static_cast<int64_t>(si)] =
+          static_cast<int32_t>(resp.selected_chunk_ids[si]);
+    }
 
     int64_t out_len = 0;
     for (uint32_t si = 0; si < resp.selected_chunk_count && out_len < max_blocks; ++si) {

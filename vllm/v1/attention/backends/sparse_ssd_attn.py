@@ -16,7 +16,10 @@ mode where full KV remains available.
 
 from typing import Any
 import copy
+import json
 import os
+import struct
+import threading
 import time
 
 import torch
@@ -303,6 +306,767 @@ def _aissd_env_float(name: str, default: float) -> float:
         return float(str(os.environ.get(name, str(default))).strip())
     except Exception:
         return float(default)
+
+
+# ---------------------------------------------------------------------------
+# Phase-1 SSD selector quality trace.
+# ---------------------------------------------------------------------------
+_AISSD_SELECTOR_QUALITY_LOCK = threading.Lock()
+_AISSD_SELECTOR_QUALITY_REQ_ORDER: dict[str, int] = {}
+_AISSD_SELECTOR_QUALITY_REQ_GENERATIONS: dict[str, dict[tuple[int, int], int]] = {}
+_AISSD_SELECTOR_QUALITY_WARNED = False
+
+
+def _aissd_selector_quality_trace_enabled() -> bool:
+    return _env_flag("AISSD_SELECTOR_QUALITY_TRACE", "0")
+
+
+def _aissd_selector_quality_reference_mode() -> str:
+    """Return selector-quality oracle mode: production, fp32, or both.
+
+    production: preserve production input precision (auto from the live Q dtype,
+    with an optional override) and use FP32 accumulation/softmax for the
+    reference score calculation.  This models the common FP16/BF16-input +
+    FP32-accumulation attention path without pretending that higher-precision
+    pre-cast Q/K values are available.
+
+    fp32: cast the *available runtime Q and raw LMCache K values* to FP32 before
+    QK.  This is a compute-precision diagnostic only; if the stored/runtime
+    tensors are already FP16/BF16 it cannot recover information lost before the
+    trace point.
+    """
+    raw = str(
+        os.environ.get("AISSD_SELECTOR_QUALITY_REFERENCE_MODE", "production")
+    ).strip().lower()
+    aliases = {
+        "prod": "production",
+        "production": "production",
+        "f32": "fp32",
+        "float32": "fp32",
+        "fp32": "fp32",
+        "both": "both",
+    }
+    mode = aliases.get(raw)
+    if mode is None:
+        raise RuntimeError(
+            "AISSD_SELECTOR_QUALITY_REFERENCE_MODE must be "
+            f"production/fp32/both, got {raw!r}"
+        )
+    return mode
+
+
+def _aissd_selector_quality_production_input_dtype(
+    query_dtype: torch.dtype,
+) -> torch.dtype:
+    """Resolve the production Q/K input dtype used by the shadow reference."""
+    raw = str(
+        os.environ.get("AISSD_SELECTOR_QUALITY_PRODUCTION_INPUT_DTYPE", "auto")
+    ).strip().lower()
+    if raw in ("", "auto", "runtime", "query"):
+        if query_dtype in (torch.float16, torch.bfloat16, torch.float32):
+            return query_dtype
+        raise RuntimeError(
+            "selector-quality production mode cannot infer an attention input "
+            f"dtype from query dtype={query_dtype}"
+        )
+    table = {
+        "fp16": torch.float16,
+        "float16": torch.float16,
+        "half": torch.float16,
+        "bf16": torch.bfloat16,
+        "bfloat16": torch.bfloat16,
+        "fp32": torch.float32,
+        "float32": torch.float32,
+    }
+    dtype = table.get(raw)
+    if dtype is None:
+        raise RuntimeError(
+            "AISSD_SELECTOR_QUALITY_PRODUCTION_INPUT_DTYPE must be "
+            f"auto/fp16/bf16/fp32, got {raw!r}"
+        )
+    return dtype
+
+
+def _aissd_selector_quality_trace_layers() -> set[int] | None:
+    raw = str(os.environ.get("AISSD_SELECTOR_QUALITY_TRACE_LAYERS", "all")).strip()
+    if not raw or raw.lower() in ("all", "*"):
+        return None
+    result: set[int] = set()
+    for part in raw.split(","):
+        part = part.strip()
+        if not part:
+            continue
+        result.add(int(part))
+    return result
+
+
+def _aissd_selector_quality_request_step(
+    req_id: str,
+    generation: int,
+    virtual_token_step: int,
+    max_requests: int,
+    max_decode_tokens: int,
+) -> tuple[int, int] | None:
+    """Return (request ordinal, sampled decode-step ordinal), or None.
+
+    ``context_generation`` is intentionally stable while one sparse LMCache
+    context is reused across many decode iterations.  Therefore it cannot be
+    used as the decode-token clock.  The selector path already maintains
+    ``aissd_token_reuse_virtual_step`` by detecting the layer-id wrap between
+    successive model passes; pair that clock with context_generation so all
+    layers in one decode pass share one sample id while the next pass advances.
+    """
+    with _AISSD_SELECTOR_QUALITY_LOCK:
+        req_ord = _AISSD_SELECTOR_QUALITY_REQ_ORDER.get(req_id)
+        if req_ord is None:
+            if len(_AISSD_SELECTOR_QUALITY_REQ_ORDER) >= max(1, int(max_requests)):
+                return None
+            req_ord = len(_AISSD_SELECTOR_QUALITY_REQ_ORDER)
+            _AISSD_SELECTOR_QUALITY_REQ_ORDER[req_id] = req_ord
+            _AISSD_SELECTOR_QUALITY_REQ_GENERATIONS[req_id] = {}
+        step_map = _AISSD_SELECTOR_QUALITY_REQ_GENERATIONS.setdefault(req_id, {})
+        sample_clock = (int(generation), int(virtual_token_step))
+        step = step_map.get(sample_clock)
+        if step is None:
+            if len(step_map) >= max(1, int(max_decode_tokens)):
+                return None
+            step = len(step_map)
+            step_map[sample_clock] = step
+        if step >= max(1, int(max_decode_tokens)):
+            return None
+        return int(req_ord), int(step)
+
+
+def _aissd_selector_quality_dtype(dtype_name: str) -> torch.dtype:
+    key = str(dtype_name).strip().upper()
+    table = {
+        "F16": torch.float16,
+        "BF16": torch.bfloat16,
+        "F32": torch.float32,
+    }
+    if key not in table:
+        raise RuntimeError(
+            f"selector-quality oracle unsupported source dtype={dtype_name!r}; "
+            "expected F16/BF16/F32"
+        )
+    return table[key]
+
+
+def _aissd_selector_quality_read_exact(fd: int, nbytes: int, offset: int) -> bytes:
+    data = os.pread(fd, int(nbytes), int(offset))
+    if len(data) != int(nbytes):
+        raise RuntimeError(
+            f"short selector-quality read offset={offset} got={len(data)} expected={nbytes}"
+        )
+    return data
+
+
+def _aissd_selector_quality_read_source_k(
+    source_path: str,
+    layer_id: int,
+    num_kv_heads: int,
+    head_size: int,
+) -> tuple[torch.Tensor, torch.dtype, str]:
+    """Read one raw LMCache K layer as CPU [T,Hkv,D], preserving source dtype.
+
+    LMCache GDS files keep a 4-KiB JSON metadata header followed by the raw
+    contiguous tensor.  The Phase-1 oracle must know the *actual* stored K
+    precision so production mode can model production input precision instead
+    of silently treating every source as an ideal FP32 tensor.
+    """
+    metadata_bytes = 4096
+    hidden = int(num_kv_heads) * int(head_size)
+    if hidden <= 0:
+        raise RuntimeError("invalid selector-quality num_kv_heads/head_size")
+    fd = os.open(source_path, os.O_RDONLY)
+    try:
+        header = _aissd_selector_quality_read_exact(fd, metadata_bytes, 0)
+        meta_len = int(struct.unpack("<Q", header[:8])[0])
+        if meta_len <= 0 or meta_len > metadata_bytes - 8:
+            raise RuntimeError(
+                f"bad LMCache metadata length={meta_len} path={source_path}"
+            )
+        meta = json.loads(header[8 : 8 + meta_len].rstrip(b" ").decode("utf-8"))
+        tensor_meta = meta["kvcache"]
+        shape = [int(x) for x in tensor_meta["shape"]]
+        dtype = _aissd_selector_quality_dtype(tensor_meta["dtype"])
+        elem_bytes = int(torch.empty((), dtype=dtype).element_size())
+        fmt = str(tensor_meta.get("fmt", "")).strip().upper().split(".")[-1]
+        # LMCache serializes MemoryFormat.value in the GDS header.  Current
+        # values are 1=KV_2LTD, 2=KV_T2D, 3=KV_2TD; also accept symbolic names.
+        fmt = {"1": "KV_2LTD", "2": "KV_T2D", "3": "KV_2TD"}.get(fmt, fmt)
+
+        if fmt == "KV_2LTD":
+            # [2, L, T, D], K is tensor[0, layer].
+            if len(shape) != 4 or shape[0] != 2:
+                raise RuntimeError(f"KV_2LTD bad shape={shape} path={source_path}")
+            _, layers, tokens, width = shape
+            if not (0 <= int(layer_id) < int(layers)) or int(width) != hidden:
+                raise RuntimeError(
+                    f"KV_2LTD layer/hidden mismatch layer={layer_id} shape={shape} hidden={hidden}"
+                )
+            byte_offset = metadata_bytes + int(layer_id) * tokens * width * elem_bytes
+            raw = _aissd_selector_quality_read_exact(
+                fd, tokens * width * elem_bytes, byte_offset
+            )
+            k = torch.frombuffer(bytearray(raw), dtype=dtype).reshape(tokens, width)
+        elif fmt == "KV_T2D":
+            # [2, T, D], file already represents one layer.
+            if len(shape) != 3 or shape[0] != 2:
+                raise RuntimeError(f"KV_T2D bad shape={shape} path={source_path}")
+            _, tokens, width = shape
+            if int(width) != hidden:
+                raise RuntimeError(
+                    f"KV_T2D hidden mismatch shape={shape} hidden={hidden}"
+                )
+            raw = _aissd_selector_quality_read_exact(
+                fd, tokens * width * elem_bytes, metadata_bytes
+            )
+            k = torch.frombuffer(bytearray(raw), dtype=dtype).reshape(tokens, width)
+        elif fmt == "KV_2TD":
+            # [T, 2, D], K/V are interleaved by token.
+            if len(shape) != 3 or shape[1] != 2:
+                raise RuntimeError(f"KV_2TD bad shape={shape} path={source_path}")
+            tokens, _, width = shape
+            if int(width) != hidden:
+                raise RuntimeError(
+                    f"KV_2TD hidden mismatch shape={shape} hidden={hidden}"
+                )
+            raw = _aissd_selector_quality_read_exact(
+                fd, tokens * 2 * width * elem_bytes, metadata_bytes
+            )
+            full = torch.frombuffer(bytearray(raw), dtype=dtype).reshape(tokens, 2, width)
+            k = full[:, 0, :]
+        elif fmt in ("K_ONLY_THD", "K_THD", "K_ONLY_TD"):
+            if len(shape) == 3:
+                tokens, hkv, dim = shape
+                if int(hkv) != int(num_kv_heads) or int(dim) != int(head_size):
+                    raise RuntimeError(
+                        f"K_ONLY_THD shape mismatch shape={shape} expected=(*,{num_kv_heads},{head_size})"
+                    )
+                width = hkv * dim
+            elif len(shape) == 2:
+                tokens, width = shape
+                if int(width) != hidden:
+                    raise RuntimeError(
+                        f"K_ONLY_TD hidden mismatch shape={shape} hidden={hidden}"
+                    )
+            else:
+                raise RuntimeError(f"K-only bad shape={shape} path={source_path}")
+            raw = _aissd_selector_quality_read_exact(
+                fd, tokens * width * elem_bytes, metadata_bytes
+            )
+            k = torch.frombuffer(bytearray(raw), dtype=dtype).reshape(tokens, width)
+        else:
+            raise RuntimeError(
+                f"selector-quality oracle unsupported LMCache fmt={fmt!r} path={source_path}"
+            )
+    finally:
+        os.close(fd)
+
+    k = k.reshape(int(k.shape[0]), int(num_kv_heads), int(head_size)).contiguous()
+    return k, dtype, fmt
+
+
+def _aissd_selector_quality_dense_masses(
+    q_row: torch.Tensor,
+    candidates: list[dict[str, Any]],
+    *,
+    layer_id: int,
+    num_heads: int,
+    num_kv_heads: int,
+    head_size: int,
+    scale: float,
+    lmcache_cached_tokens: int,
+    reference_mode: str,
+) -> tuple[list[float], dict[str, Any]]:
+    """Dense-attention chunk importance over the SSD candidate pool.
+
+    production mode models low-precision production inputs followed by FP32
+    accumulation/softmax.  The low-precision values are first rounded to the
+    resolved production input dtype, then converted to FP32 for the explicit
+    reference dot product.  This is numerically equivalent to using those
+    low-precision input values with FP32 multiply/accumulation for this scalar
+    reference calculation.
+
+    fp32 mode performs the dot product in FP32 from the Q/K values available at
+    this trace point.  It is *not* a true pre-cast FP32-model oracle when runtime
+    Q or stored K are already FP16/BF16; lost source precision cannot be
+    recovered after the fact.
+    """
+    mode = str(reference_mode).strip().lower()
+    if mode not in ("production", "fp32"):
+        raise RuntimeError(f"bad selector-quality reference_mode={reference_mode!r}")
+
+    q_runtime = q_row.detach().to(device="cpu").reshape(
+        int(num_heads), int(head_size)
+    )
+    runtime_q_dtype = q_runtime.dtype
+    production_dtype = _aissd_selector_quality_production_input_dtype(runtime_q_dtype)
+    if mode == "production":
+        # Round/preserve the production input precision, but accumulate in FP32.
+        q_compute = q_runtime.to(dtype=production_dtype).to(dtype=torch.float32)
+    else:
+        q_compute = q_runtime.to(dtype=torch.float32)
+
+    if int(num_heads) % int(num_kv_heads) != 0:
+        raise RuntimeError(
+            f"GQA mismatch num_heads={num_heads} num_kv_heads={num_kv_heads}"
+        )
+    q_per_kv = int(num_heads) // int(num_kv_heads)
+    q_grouped = q_compute.reshape(int(num_kv_heads), q_per_kv, int(head_size))
+
+    score_chunks: list[torch.Tensor] = []
+    valid_lengths: list[int] = []
+    source_k_dtypes: set[str] = set()
+    source_formats: set[str] = set()
+    for rec in candidates:
+        source_path = str(rec.get("source_path") or "")
+        if not source_path:
+            raise RuntimeError(f"selector-quality candidate lacks source_path: {rec}")
+        k_raw, k_source_dtype, source_fmt = _aissd_selector_quality_read_source_k(
+            source_path,
+            int(layer_id),
+            int(num_kv_heads),
+            int(head_size),
+        )
+        source_k_dtypes.add(str(k_source_dtype))
+        source_formats.add(str(source_fmt))
+        if mode == "production":
+            # Q/K attention inputs are modeled at the same production precision.
+            k_compute = k_raw.to(dtype=production_dtype).to(dtype=torch.float32)
+        else:
+            k_compute = k_raw.to(dtype=torch.float32)
+
+        ts = int(rec.get("token_start", 0))
+        te = int(rec.get("token_end", ts + int(k_compute.shape[0])))
+        valid_end = min(int(te), max(0, int(lmcache_cached_tokens)))
+        valid = max(0, min(int(k_compute.shape[0]), valid_end - ts))
+        if valid <= 0:
+            score_chunks.append(torch.empty((int(num_heads), 0), dtype=torch.float32))
+            valid_lengths.append(0)
+            continue
+        k_compute = k_compute[:valid]
+        # [Hkv,G,D] x [T,Hkv,D] -> [Hkv,G,T] -> [Hq,T].  Both modes use
+        # explicit FP32 accumulation and FP32 softmax; they differ in the input
+        # values supplied to this calculation.
+        scores = torch.einsum("hgd,thd->hgt", q_grouped, k_compute)
+        scores = scores.reshape(int(num_heads), valid) * float(scale)
+        score_chunks.append(scores)
+        valid_lengths.append(valid)
+
+    total_valid = sum(valid_lengths)
+    if total_valid <= 0:
+        raise RuntimeError("selector-quality Dense oracle has zero valid candidate tokens")
+    merged = torch.cat(score_chunks, dim=1)
+    probs = torch.softmax(merged, dim=-1, dtype=torch.float32)
+    masses: list[float] = []
+    offset = 0
+    for valid in valid_lengths:
+        if valid <= 0:
+            masses.append(0.0)
+            continue
+        mass = probs[:, offset : offset + valid].sum(dim=-1).mean()
+        masses.append(float(mass.item()))
+        offset += valid
+
+    meta: dict[str, Any] = {
+        "reference_mode": mode,
+        "runtime_query_dtype": str(runtime_q_dtype),
+        "raw_key_dtypes": sorted(source_k_dtypes),
+        "source_formats": sorted(source_formats),
+        "accumulation_dtype": "torch.float32",
+        "softmax_dtype": "torch.float32",
+    }
+    if mode == "production":
+        meta.update(
+            {
+                "production_input_dtype": str(production_dtype),
+                "production_dtype_source": str(
+                    os.environ.get(
+                        "AISSD_SELECTOR_QUALITY_PRODUCTION_INPUT_DTYPE", "auto"
+                    )
+                ),
+                "numerical_semantics": "production_input_precision_fp32_accum_softmax",
+            }
+        )
+    else:
+        meta.update(
+            {
+                "compute_dtype": "torch.float32",
+                "input_origin": "runtime_q_and_raw_lmcache_k",
+                "precast_fp32_values_available": False,
+                "numerical_semantics": "fp32_compute_from_available_runtime_values",
+            }
+        )
+    return masses, meta
+
+
+def _aissd_selector_quality_metrics(
+    masses: list[float],
+    ssd_selected: list[int],
+    candidates: list[dict[str, Any]],
+    top_n: int,
+) -> dict[str, Any]:
+    oracle_k = min(max(1, int(top_n)), len(masses))
+    mass_tensor = torch.tensor(masses, dtype=torch.float64)
+    oracle_ids = [
+        int(x)
+        for x in torch.topk(mass_tensor, k=oracle_k, largest=True).indices.tolist()
+    ]
+    ssd_ids = [c for c in ssd_selected if 0 <= c < len(masses)]
+    ssd_mass = float(sum(masses[c] for c in ssd_ids))
+    oracle_mass = float(sum(masses[c] for c in oracle_ids))
+    oracle_recall = (
+        float(len(set(ssd_ids).intersection(oracle_ids))) / float(oracle_k)
+        if oracle_k > 0
+        else 0.0
+    )
+    return {
+        "ssd_selected_count": int(len(ssd_ids)),
+        "ssd_selected": _aissd_selector_quality_compact_chunks(
+            ssd_ids, candidates, masses
+        ),
+        "oracle_topn": _aissd_selector_quality_compact_chunks(
+            oracle_ids, candidates, masses
+        ),
+        "attention_mass_recall": float(ssd_mass),
+        "oracle_topn_recall": float(oracle_recall),
+        "oracle_mass": float(oracle_mass),
+        "selection_regret": float(oracle_mass - ssd_mass),
+        "candidate_mass_sum": float(sum(masses)),
+    }
+
+
+def _aissd_selector_quality_candidate_indices_from_rpc(
+    candidate_chunk_ids: torch.Tensor,
+    rpc_selected_chunk_ids: list[int],
+    candidate_count: int,
+) -> list[int]:
+    """Map exact SSD RPC chunk IDs back to candidate-row indices.
+
+    Phase-1 must never infer selector output from selected_block_table.  Block IDs
+    are an attention-consumer representation and may be reindexed/compacted; the
+    SSD response chunk IDs are the authoritative selector result.
+    """
+    chunk_to_candidate: dict[int, int] = {}
+    for c in range(max(0, int(candidate_count))):
+        chunk_id = int(candidate_chunk_ids[c].item())
+        if chunk_id < 0:
+            continue
+        if chunk_id in chunk_to_candidate:
+            raise RuntimeError(
+                "selector-quality duplicate candidate chunk_id="
+                f"{chunk_id} at candidate rows {chunk_to_candidate[chunk_id]} and {c}"
+            )
+        chunk_to_candidate[chunk_id] = int(c)
+
+    result: list[int] = []
+    seen: set[int] = set()
+    for raw_chunk_id in rpc_selected_chunk_ids:
+        chunk_id = int(raw_chunk_id)
+        if chunk_id < 0:
+            continue
+        if chunk_id not in chunk_to_candidate:
+            raise RuntimeError(
+                "selector-quality SSD RPC returned unknown chunk_id="
+                f"{chunk_id}; candidate_count={candidate_count}"
+            )
+        candidate_idx = chunk_to_candidate[chunk_id]
+        if candidate_idx in seen:
+            raise RuntimeError(
+                "selector-quality SSD RPC returned duplicate selected chunk_id="
+                f"{chunk_id}"
+            )
+        seen.add(candidate_idx)
+        result.append(candidate_idx)
+    return result
+
+
+def _aissd_selector_quality_compact_chunks(
+    ids: list[int],
+    candidates: list[dict[str, Any]],
+    masses: list[float],
+) -> list[dict[str, Any]]:
+    out: list[dict[str, Any]] = []
+    for c in ids:
+        if c < 0 or c >= len(candidates) or c >= len(masses):
+            continue
+        rec = candidates[c]
+        out.append(
+            {
+                "candidate_id": int(c),
+                "source_chunk_index": int(rec.get("source_chunk_index", c)),
+                "token_start": int(rec.get("token_start", 0)),
+                "token_end": int(rec.get("token_end", 0)),
+                "dense_mass": float(masses[c]),
+            }
+        )
+    return out
+
+
+def _aissd_selector_quality_append_json(record: dict[str, Any]) -> None:
+    path = str(
+        os.environ.get(
+            "AISSD_SELECTOR_QUALITY_TRACE_PATH",
+            "/tmp/aissd_selector_quality_trace.jsonl",
+        )
+    ).strip()
+    if not path:
+        return
+    parent = os.path.dirname(path)
+    if parent:
+        os.makedirs(parent, exist_ok=True)
+    line = json.dumps(record, sort_keys=True, separators=(",", ":"))
+    with _AISSD_SELECTOR_QUALITY_LOCK:
+        with open(path, "a", encoding="utf-8") as f:
+            f.write(line + "\n")
+
+
+def _aissd_maybe_trace_selector_quality(
+    *,
+    query: torch.Tensor,
+    step_context: dict[str, Any],
+    layer_name: str,
+    layer_id: int,
+    num_heads: int,
+    num_kv_heads: int,
+    head_size: int,
+    attention_scale: float,
+) -> None:
+    """Sample SSD selections against a raw-K Dense-Attention oracle."""
+    global _AISSD_SELECTOR_QUALITY_WARNED
+    if not _aissd_selector_quality_trace_enabled():
+        return
+    if torch.cuda.is_current_stream_capturing():
+        return
+    layers = _aissd_selector_quality_trace_layers()
+    if layers is not None and int(layer_id) not in layers:
+        return
+
+    max_requests = max(1, _aissd_env_int("AISSD_SELECTOR_QUALITY_TRACE_MAX_REQUESTS", 2))
+    max_decode = max(1, _aissd_env_int("AISSD_SELECTOR_QUALITY_TRACE_MAX_DECODE_TOKENS", 2))
+    raw_generation = step_context.get("context_generation", -1)
+    generation = -1 if raw_generation is None else int(raw_generation)
+    virtual_token_step = int(
+        step_context.get("aissd_token_reuse_virtual_step", 0) or 0
+    )
+    req_ids = list(step_context.get("req_ids", []))
+    active_reqs = min(
+        int(step_context.get("host_active_reqs", 0) or 0),
+        len(req_ids),
+    )
+    if active_reqs <= 0:
+        return
+
+    if not _AISSD_SELECTOR_QUALITY_WARNED:
+        layer_reuse = _aissd_layer_reuse_enabled()
+        token_reuse = _aissd_token_reuse_strategy()
+        if layer_reuse or token_reuse not in ("none", "off", "disabled"):
+            logger.warning(
+                "[aissd-selector-quality] Phase-1 isolation is intended for "
+                "AISSD_SPARSE_KV_LAYER_REUSE=0 and AISSD_TOKEN_REUSE_STRATEGY=none; "
+                "current layer_reuse=%s token_reuse=%s",
+                layer_reuse,
+                token_reuse,
+            )
+        _AISSD_SELECTOR_QUALITY_WARNED = True
+
+    quality_by_layer = step_context.get("aissd_quality_host_candidates")
+    if not isinstance(quality_by_layer, dict):
+        raise RuntimeError(
+            "AISSD selector quality trace requires vllm_v1_adapter Phase-1 host "
+            "candidate metadata; update vllm_v1_adapter.py"
+        )
+    candidate_rows = quality_by_layer.get(int(layer_id))
+    if candidate_rows is None:
+        candidate_rows = quality_by_layer.get(str(int(layer_id)))
+    if not isinstance(candidate_rows, list):
+        raise RuntimeError(
+            f"AISSD selector quality trace lacks candidate rows for layer={layer_id}"
+        )
+
+    q_view = _aissd_q_drift_query_view(query, active_reqs, num_heads, head_size)
+    if q_view is None:
+        raise RuntimeError(
+            "AISSD selector quality trace expects one decode Q row per active request: "
+            f"q_shape={tuple(query.shape)} active_reqs={active_reqs} "
+            f"num_heads={num_heads} head_size={head_size}"
+        )
+
+    candidate_count_t = step_context.get("aissd_candidate_count")
+    candidate_chunk_ids_t = step_context.get("aissd_candidate_chunk_ids")
+    rpc_selected_chunk_ids_t = step_context.get("aissd_rpc_selected_chunk_ids")
+    rpc_selected_chunk_lens_t = step_context.get("aissd_rpc_selected_chunk_lens")
+    selected_lens_t = step_context.get("selected_block_lens")
+    cached_tokens_t = step_context.get("req_lmcache_cached_tokens")
+    required = (
+        candidate_count_t,
+        candidate_chunk_ids_t,
+        rpc_selected_chunk_ids_t,
+        rpc_selected_chunk_lens_t,
+        selected_lens_t,
+        cached_tokens_t,
+    )
+    if not all(isinstance(x, torch.Tensor) for x in required):
+        raise RuntimeError("AISSD selector quality trace missing selector metadata tensors")
+
+    # These copies intentionally synchronize only in the sampled debug path.
+    cand_count_cpu = candidate_count_t.detach().to("cpu")
+    cand_chunk_ids_cpu = candidate_chunk_ids_t.detach().to("cpu")
+    # These two tensors are already CPU-side and are written directly by the C++
+    # selector bridge from resp.selected_chunk_ids[].  Keep .detach().to("cpu")
+    # for a uniform defensive snapshot in the sampled debug path.
+    rpc_selected_ids_cpu = rpc_selected_chunk_ids_t.detach().to("cpu")
+    rpc_selected_lens_cpu = rpc_selected_chunk_lens_t.detach().to("cpu")
+    selected_lens_cpu = selected_lens_t.detach().to("cpu")
+    cached_tokens_cpu = cached_tokens_t.detach().to("cpu")
+    top_n = max(1, int(step_context.get("top_n_chunks", 1) or 1))
+    trace_tag = str(os.environ.get("AISSD_SELECTOR_QUALITY_TRACE_TAG", ""))
+
+    for r in range(active_reqs):
+        req_id = str(req_ids[r])
+        sample = _aissd_selector_quality_request_step(
+            req_id,
+            generation,
+            virtual_token_step,
+            max_requests,
+            max_decode,
+        )
+        if sample is None:
+            continue
+        req_ordinal, decode_step = sample
+        if r >= len(candidate_rows) or not isinstance(candidate_rows[r], list):
+            raise RuntimeError(
+                f"selector-quality candidate row missing req={req_id} layer={layer_id} row={r}"
+            )
+        candidates = candidate_rows[r]
+        candidate_count = min(int(cand_count_cpu[r].item()), len(candidates))
+        candidates = candidates[:candidate_count]
+        if candidate_count <= 0:
+            continue
+        selected_len = max(0, int(selected_lens_cpu[r].item()))
+        rpc_selected_len = max(0, int(rpc_selected_lens_cpu[r].item()))
+        if rpc_selected_len > int(rpc_selected_ids_cpu.shape[1]):
+            raise RuntimeError(
+                "selector-quality RPC selected length exceeds buffer capacity: "
+                f"len={rpc_selected_len} capacity={int(rpc_selected_ids_cpu.shape[1])}"
+            )
+        rpc_selected_chunk_ids = [
+            int(x)
+            for x in rpc_selected_ids_cpu[r, :rpc_selected_len].tolist()
+            if int(x) >= 0
+        ]
+        ssd_selected = _aissd_selector_quality_candidate_indices_from_rpc(
+            cand_chunk_ids_cpu[r],
+            rpc_selected_chunk_ids,
+            candidate_count,
+        )
+        cached_tokens = int(cached_tokens_cpu[r].item())
+        t0 = time.perf_counter()
+        requested_mode = _aissd_selector_quality_reference_mode()
+        modes = (
+            ("production", "fp32")
+            if requested_mode == "both"
+            else (requested_mode,)
+        )
+        references: dict[str, dict[str, Any]] = {}
+        for mode in modes:
+            masses, ref_meta = _aissd_selector_quality_dense_masses(
+                q_view[r],
+                candidates,
+                layer_id=int(layer_id),
+                num_heads=int(num_heads),
+                num_kv_heads=int(num_kv_heads),
+                head_size=int(head_size),
+                scale=float(attention_scale),
+                lmcache_cached_tokens=int(cached_tokens),
+                reference_mode=mode,
+            )
+            metrics = _aissd_selector_quality_metrics(
+                masses,
+                ssd_selected,
+                candidates,
+                top_n,
+            )
+            references[mode] = {**ref_meta, **metrics}
+
+        # Production is the primary ground truth whenever it was requested.
+        primary_mode = "production" if "production" in references else "fp32"
+        primary = references[primary_mode]
+        elapsed_ms = (time.perf_counter() - t0) * 1000.0
+        record = {
+            "schema_version": 3,
+            "tag": trace_tag,
+            "req_id": req_id,
+            "request_ordinal": int(req_ordinal),
+            "decode_step": int(decode_step),
+            "generation": int(generation),
+            "virtual_token_step": int(virtual_token_step),
+            "layer_id": int(layer_id),
+            "layer_name": str(layer_name),
+            "query_dtype": str(query.dtype),
+            "reference_mode_requested": requested_mode,
+            "primary_reference_mode": primary_mode,
+            "importance_scope": "lmcache_ssd_candidate_pool",
+            "candidate_count": int(candidate_count),
+            "top_n": int(top_n),
+            "selected_block_count": int(selected_len),
+            "ssd_selected_source": "ssd_rpc_selected_chunk_ids",
+            "ssd_rpc_selected_chunk_count": int(rpc_selected_len),
+            "ssd_rpc_selected_chunk_ids_raw": rpc_selected_chunk_ids,
+            "references": references,
+            # Backward-friendly aliases always point at the primary reference.
+            "ssd_selected_count": int(primary["ssd_selected_count"]),
+            "ssd_selected": primary["ssd_selected"],
+            "oracle_topn": primary["oracle_topn"],
+            "attention_mass_recall": float(primary["attention_mass_recall"]),
+            "oracle_topn_recall": float(primary["oracle_topn_recall"]),
+            "oracle_mass": float(primary["oracle_mass"]),
+            "selection_regret": float(primary["selection_regret"]),
+            "candidate_mass_sum": float(primary["candidate_mass_sum"]),
+            "lmcache_cached_tokens": int(cached_tokens),
+            "trace_elapsed_ms": float(elapsed_ms),
+        }
+        _aissd_selector_quality_append_json(record)
+        logger.info(
+            "[aissd-selector-quality] req=%s decode_step=%d layer=%d candidates=%d "
+            "top_n=%d ref=%s input=%s accum=%s ssd_selected=%d rpc_chunks=%s amr=%.6f "
+            "oracle_recall=%.6f oracle_mass=%.6f regret=%.6f trace_ms=%.3f",
+            req_id,
+            decode_step,
+            int(layer_id),
+            candidate_count,
+            top_n,
+            primary_mode,
+            str(primary.get("production_input_dtype", "torch.float32")),
+            str(primary.get("accumulation_dtype", "torch.float32")),
+            int(primary["ssd_selected_count"]),
+            rpc_selected_chunk_ids,
+            float(primary["attention_mass_recall"]),
+            float(primary["oracle_topn_recall"]),
+            float(primary["oracle_mass"]),
+            float(primary["selection_regret"]),
+            elapsed_ms,
+        )
+        if requested_mode == "both":
+            prod = references["production"]
+            f32 = references["fp32"]
+            logger.info(
+                "[aissd-selector-quality-refdiff] req=%s decode_step=%d layer=%d "
+                "prod_amr=%.6f fp32_amr=%.6f prod_recall=%.6f fp32_recall=%.6f "
+                "prod_regret=%.6f fp32_regret=%.6f",
+                req_id,
+                decode_step,
+                int(layer_id),
+                float(prod["attention_mass_recall"]),
+                float(f32["attention_mass_recall"]),
+                float(prod["oracle_topn_recall"]),
+                float(f32["oracle_topn_recall"]),
+                float(prod["selection_regret"]),
+                float(f32["selection_regret"]),
+            )
+
 
 
 def _aissd_token_reuse_strategy() -> str:
@@ -1160,6 +1924,73 @@ def _aissd_restore_selected_metadata(
     return True
 
 
+def _aissd_ensure_rpc_selected_chunk_buffers(
+    step_context: dict[str, Any],
+) -> None:
+    """Ensure HOST-visible buffers for the raw SSD RPC selected chunk IDs.
+
+    These tensors are Phase-1 diagnostic outputs only. They are CPU tensors and
+    are not CUDA-graph-visible, so it is safe to create/grow them lazily in the
+    real selector path. This also keeps the attention backend compatible with a
+    step context produced by an LMCache adapter that predates these diagnostic
+    fields.
+    """
+    try:
+        host_active_reqs = int(step_context.get("host_active_reqs", 0) or 0)
+    except Exception:
+        host_active_reqs = 0
+
+    selected_lens = step_context.get("selected_block_lens")
+    selected_rows = (
+        int(selected_lens.numel())
+        if isinstance(selected_lens, torch.Tensor) and selected_lens.dim() == 1
+        else 0
+    )
+    max_reqs = max(1, host_active_reqs, selected_rows)
+
+    try:
+        top_n = int(step_context.get("top_n_chunks", 1) or 1)
+    except Exception:
+        top_n = 1
+    max_selected_chunks = max(1, top_n)
+
+    ids = step_context.get("aissd_rpc_selected_chunk_ids")
+    if (
+        not isinstance(ids, torch.Tensor)
+        or ids.device.type != "cpu"
+        or ids.dtype != torch.int32
+        or ids.dim() != 2
+        or int(ids.shape[0]) < max_reqs
+        or int(ids.shape[1]) < max_selected_chunks
+        or not ids.is_contiguous()
+    ):
+        ids = torch.full(
+            (max_reqs, max_selected_chunks),
+            -1,
+            dtype=torch.int32,
+            device="cpu",
+        )
+        step_context["aissd_rpc_selected_chunk_ids"] = ids
+
+    lens = step_context.get("aissd_rpc_selected_chunk_lens")
+    if (
+        not isinstance(lens, torch.Tensor)
+        or lens.device.type != "cpu"
+        or lens.dtype != torch.int32
+        or lens.dim() != 1
+        or int(lens.shape[0]) < max_reqs
+        or not lens.is_contiguous()
+    ):
+        lens = torch.zeros(max_reqs, dtype=torch.int32, device="cpu")
+        step_context["aissd_rpc_selected_chunk_lens"] = lens
+
+    # Clear stale diagnostics before each real selector invocation. The C++ op
+    # also initializes these outputs, but doing it here makes the Python-side
+    # lifetime semantics explicit if an RPC fails before publishing a result.
+    ids.fill_(-1)
+    lens.zero_()
+
+
 def _maybe_run_aissd_selector_op(
     query: torch.Tensor,
     step_context: dict[str, Any],
@@ -1167,6 +1998,7 @@ def _maybe_run_aissd_selector_op(
     head_size: int,
     num_heads: int,
     num_kv_heads: int,
+    attention_scale: float,
 ) -> float:
     """Run AISSD q-aware selector before sparse FlashAttention.
 
@@ -1432,6 +2264,11 @@ def _maybe_run_aissd_selector_op(
                 token_state.get("token_step"),
             )
 
+    # Raw SSD selected chunk IDs are diagnostic CPU outputs, not native
+    # candidate inputs.  Create them lazily here instead of requiring
+    # prepare_sparse_kv_step() to publish them.
+    _aissd_ensure_rpc_selected_chunk_buffers(step_context)
+
     required = (
         "aissd_candidate_count",
         "aissd_candidate_chunk_ids",
@@ -1448,6 +2285,8 @@ def _maybe_run_aissd_selector_op(
         "aissd_candidate_extent_bytes",
         "fa_block_table",
         "fa_seq_lens",
+        "aissd_rpc_selected_chunk_ids",
+        "aissd_rpc_selected_chunk_lens",
     )
     missing = [k for k in required if k not in step_context]
     if missing:
@@ -1491,6 +2330,8 @@ def _maybe_run_aissd_selector_op(
         step_context["selected_ready_flags"],
         step_context["fa_block_table"],
         step_context["fa_seq_lens"],
+        step_context["aissd_rpc_selected_chunk_ids"],
+        step_context["aissd_rpc_selected_chunk_lens"],
         layer_id,
         backend,
         int(num_heads),
@@ -1504,6 +2345,27 @@ def _maybe_run_aissd_selector_op(
         int(step_context.get("aissd_manifest_block_size", 4096)),
         int(step_context.get("aissd_timeout_ms", 300000)),
     )
+    if _aissd_selector_quality_trace_enabled():
+        try:
+            _aissd_maybe_trace_selector_quality(
+                query=query,
+                step_context=step_context,
+                layer_name=layer_name,
+                layer_id=int(layer_id),
+                num_heads=int(num_heads),
+                num_kv_heads=int(num_kv_heads),
+                head_size=int(head_size),
+                attention_scale=float(attention_scale),
+            )
+        except Exception as exc:
+            if _env_flag("AISSD_SELECTOR_QUALITY_TRACE_STRICT", "0"):
+                raise
+            logger.warning(
+                "[aissd-selector-quality] trace failed layer=%s error=%s",
+                layer_name,
+                exc,
+                exc_info=True,
+            )
     if layer_reuse_enabled and layer_reuse_strategy == "static":
         cache_t0 = time.perf_counter()
         _aissd_cache_selected_metadata(
@@ -2444,6 +3306,7 @@ class SparseSSDAttentionImpl(AttentionImpl[AttentionMetadata]):
                     head_size=int(self.head_size),
                     num_heads=int(self.num_heads),
                     num_kv_heads=int(self.num_kv_heads),
+                    attention_scale=float(self.scale),
                 )
                 if impl in ("fa_varlen", "flash", "flash_attn", "flashattention"):
                     attn_t0 = time.perf_counter()
