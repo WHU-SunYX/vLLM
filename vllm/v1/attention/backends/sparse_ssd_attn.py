@@ -316,6 +316,14 @@ _AISSD_SELECTOR_QUALITY_REQ_ORDER: dict[str, int] = {}
 _AISSD_SELECTOR_QUALITY_REQ_GENERATIONS: dict[str, dict[tuple[int, int], int]] = {}
 _AISSD_SELECTOR_QUALITY_WARNED = False
 
+# Real Q/K calibration capture for the external NPU compiler.  This is
+# intentionally independent of Phase-1 selector-quality tracing: calibration
+# runs can dump representative model inputs without also paying the dense-oracle
+# QK/softmax cost.
+_AISSD_QK_CALIB_LOCK = threading.Lock()
+_AISSD_QK_CALIB_SEEN: set[tuple[str, int, int, int, int]] = set()
+_AISSD_QK_CALIB_NEXT_SAMPLE = 0
+
 
 def _aissd_selector_quality_trace_enabled() -> bool:
     return _env_flag("AISSD_SELECTOR_QUALITY_TRACE", "0")
@@ -566,6 +574,356 @@ def _aissd_selector_quality_read_source_k(
 
     k = k.reshape(int(k.shape[0]), int(num_kv_heads), int(head_size)).contiguous()
     return k, dtype, fmt
+
+
+def _aissd_qk_calib_dump_enabled() -> bool:
+    return _env_flag("AISSD_QK_CALIB_DUMP", "0")
+
+
+def _aissd_qk_calib_dense_baseline_enabled() -> bool:
+    """Capture real Q/K while keeping model attention on the full/dense path."""
+    return (
+        _aissd_qk_calib_dump_enabled()
+        and _env_flag("AISSD_QK_CALIB_DENSE_BASELINE", "0")
+    )
+
+
+def _aissd_qk_calib_dump_layers() -> set[int] | None:
+    raw = str(os.environ.get("AISSD_QK_CALIB_DUMP_LAYERS", "all")).strip()
+    if not raw or raw.lower() in ("all", "*"):
+        return None
+    result: set[int] = set()
+    for part in raw.split(","):
+        part = part.strip()
+        if part:
+            result.add(int(part))
+    return result
+
+
+def _aissd_qk_calib_dump_bucket() -> int:
+    # The current production problem is the c128 npubin.  Keep the bucket
+    # explicit because each compiled npubin has a fixed [C*T, Hkv*D] shape.
+    return max(1, _aissd_env_int("AISSD_QK_CALIB_DUMP_BUCKET", 128))
+
+
+def _aissd_qk_calib_dump_max_samples() -> int:
+    return max(1, _aissd_env_int("AISSD_QK_CALIB_DUMP_MAX_SAMPLES", 72))
+
+
+def _aissd_qk_calib_pack_q_block(
+    q_row: torch.Tensor,
+    num_heads: int,
+    num_kv_heads: int,
+    head_size: int,
+) -> torch.Tensor:
+    """Build logical FP32 q_block exactly like export_onnx.py packed mode.
+
+    q_row:   [Hq,D]
+    q_block: [Hkv*D,Hq]
+    """
+    hq = int(num_heads)
+    hkv = int(num_kv_heads)
+    dim = int(head_size)
+    if hq <= 0 or hkv <= 0 or dim <= 0 or hq % hkv != 0:
+        raise RuntimeError(
+            f"invalid QK calibration GQA shape Hq={hq} Hkv={hkv} D={dim}"
+        )
+    q = q_row.detach().to(device="cpu", dtype=torch.float32).reshape(hq, dim)
+    q_per_kv = hq // hkv
+    q_block = torch.zeros((hkv * dim, hq), dtype=torch.float32)
+    for h in range(hkv):
+        row0 = h * dim
+        row1 = row0 + dim
+        col0 = h * q_per_kv
+        col1 = col0 + q_per_kv
+        # q[col0:col1] is [QperKV,D]; q_block slice is [D,QperKV].
+        q_block[row0:row1, col0:col1] = q[col0:col1].transpose(0, 1)
+    return q_block.contiguous()
+
+
+def _aissd_qk_calib_write_fp32(path: str, tensor: torch.Tensor) -> None:
+    value = tensor.detach().to(device="cpu", dtype=torch.float32).contiguous()
+    tmp = path + ".tmp"
+    with open(tmp, "wb") as f:
+        f.write(value.numpy().tobytes(order="C"))
+        f.flush()
+        os.fsync(f.fileno())
+    os.replace(tmp, path)
+
+
+def _aissd_qk_calib_stats(tensor: torch.Tensor) -> dict[str, float]:
+    value = tensor.detach().to(device="cpu", dtype=torch.float32)
+    if value.numel() == 0:
+        return {"min": 0.0, "max": 0.0, "mean": 0.0, "abs_max": 0.0}
+    return {
+        "min": float(torch.amin(value).item()),
+        "max": float(torch.amax(value).item()),
+        "mean": float(torch.mean(value).item()),
+        "abs_max": float(torch.amax(torch.abs(value)).item()),
+    }
+
+
+def _aissd_maybe_dump_qk_calibration(
+    *,
+    query: torch.Tensor,
+    step_context: dict[str, Any],
+    layer_name: str,
+    layer_id: int,
+    num_heads: int,
+    num_kv_heads: int,
+    head_size: int,
+) -> None:
+    """Dump compiler-ready real FP32 k_flat/q_block calibration samples.
+
+    Output layout:
+      <AISSD_QK_CALIB_DUMP_DIR>/<sample>/k_flat.bin
+      <AISSD_QK_CALIB_DUMP_DIR>/<sample>/q_block.bin
+
+    The files exactly match the logical external tensors of
+    SparseQKPackedSingleMatMulModel:
+      k_flat  [bucket*chunk_size, Hkv*D] FP32
+      q_block [Hkv*D, Hq] FP32
+
+    A separate JSONL manifest is written next to the dataset directory so the NPU
+    toolchain sees only the numbered sample directories and input .bin files.
+    """
+    global _AISSD_QK_CALIB_NEXT_SAMPLE
+
+    if not _aissd_qk_calib_dump_enabled():
+        return
+    if torch.cuda.is_current_stream_capturing():
+        return
+
+    layers = _aissd_qk_calib_dump_layers()
+    if layers is not None and int(layer_id) not in layers:
+        return
+
+    req_ids = list(step_context.get("req_ids", []))
+    active_reqs = min(
+        int(step_context.get("host_active_reqs", 0) or 0),
+        len(req_ids),
+    )
+    if active_reqs <= 0:
+        return
+
+    q_view = _aissd_q_drift_query_view(
+        query, active_reqs, int(num_heads), int(head_size)
+    )
+    if q_view is None:
+        raise RuntimeError(
+            "AISSD QK calibration expects one decode Q row per active request: "
+            f"q_shape={tuple(query.shape)} active_reqs={active_reqs} "
+            f"num_heads={num_heads} head_size={head_size}"
+        )
+
+    quality_by_layer = step_context.get("aissd_quality_host_candidates")
+    if not isinstance(quality_by_layer, dict):
+        raise RuntimeError(
+            "AISSD QK calibration requires host raw-candidate metadata from "
+            "vllm_v1_adapter.py; enable the matching calibration-aware adapter"
+        )
+    candidate_rows = quality_by_layer.get(int(layer_id))
+    if candidate_rows is None:
+        candidate_rows = quality_by_layer.get(str(int(layer_id)))
+    if not isinstance(candidate_rows, list):
+        raise RuntimeError(
+            f"AISSD QK calibration lacks candidate rows for layer={layer_id}"
+        )
+
+    candidate_count_t = step_context.get("aissd_candidate_count")
+    cached_tokens_t = step_context.get("req_lmcache_cached_tokens")
+    if not isinstance(candidate_count_t, torch.Tensor) or not isinstance(
+        cached_tokens_t, torch.Tensor
+    ):
+        raise RuntimeError("AISSD QK calibration missing candidate/cache metadata")
+
+    candidate_count_cpu = candidate_count_t.detach().to("cpu")
+    cached_tokens_cpu = cached_tokens_t.detach().to("cpu")
+    generation = int(step_context.get("context_generation", -1) or -1)
+    virtual_token_step = int(
+        step_context.get("aissd_token_reuse_virtual_step", 0) or 0
+    )
+    chunk_size = int(step_context.get("chunk_size", 0) or 0)
+    bucket = _aissd_qk_calib_dump_bucket()
+    max_samples = _aissd_qk_calib_dump_max_samples()
+    if chunk_size <= 0:
+        raise RuntimeError("AISSD QK calibration has invalid chunk_size")
+
+    dump_dir = os.path.abspath(
+        str(
+            os.environ.get(
+                "AISSD_QK_CALIB_DUMP_DIR",
+                f"/tmp/aissd_qk_calib_dataset_c{bucket}",
+            )
+        )
+    )
+    manifest_path = os.path.abspath(
+        str(
+            os.environ.get(
+                "AISSD_QK_CALIB_DUMP_MANIFEST",
+                dump_dir.rstrip(os.sep) + ".jsonl",
+            )
+        )
+    )
+    os.makedirs(dump_dir, exist_ok=True)
+    manifest_parent = os.path.dirname(manifest_path)
+    if manifest_parent:
+        os.makedirs(manifest_parent, exist_ok=True)
+
+    for r in range(active_reqs):
+        req_id = str(req_ids[r])
+        key = (req_id, generation, virtual_token_step, int(layer_id), int(r))
+
+        with _AISSD_QK_CALIB_LOCK:
+            if key in _AISSD_QK_CALIB_SEEN:
+                continue
+            if _AISSD_QK_CALIB_NEXT_SAMPLE >= max_samples:
+                return
+            sample_idx = int(_AISSD_QK_CALIB_NEXT_SAMPLE)
+            _AISSD_QK_CALIB_NEXT_SAMPLE += 1
+            _AISSD_QK_CALIB_SEEN.add(key)
+
+        try:
+            if r >= len(candidate_rows) or not isinstance(candidate_rows[r], list):
+                raise RuntimeError(
+                    f"QK calibration candidate row missing req={req_id} "
+                    f"layer={layer_id} row={r}"
+                )
+            candidates = candidate_rows[r]
+            candidate_count = min(
+                int(candidate_count_cpu[r].item()), len(candidates)
+            )
+            if candidate_count <= 0:
+                raise RuntimeError(
+                    f"QK calibration has zero candidates req={req_id} layer={layer_id}"
+                )
+            if candidate_count > bucket:
+                raise RuntimeError(
+                    f"QK calibration candidate_count={candidate_count} exceeds "
+                    f"compiled bucket={bucket}; capture the bucket that would "
+                    "actually serve this request"
+                )
+
+            cached_tokens = int(cached_tokens_cpu[r].item())
+            k_bucket = torch.zeros(
+                (bucket, chunk_size, int(num_kv_heads), int(head_size)),
+                dtype=torch.float32,
+            )
+            source_k_dtypes: set[str] = set()
+            source_formats: set[str] = set()
+
+            for c in range(candidate_count):
+                rec = candidates[c]
+                source_path = str(rec.get("source_path") or "")
+                if not source_path:
+                    raise RuntimeError(
+                        f"QK calibration candidate lacks source_path: {rec}"
+                    )
+                k_raw, k_dtype, source_fmt = _aissd_selector_quality_read_source_k(
+                    source_path,
+                    int(layer_id),
+                    int(num_kv_heads),
+                    int(head_size),
+                )
+                source_k_dtypes.add(str(k_dtype))
+                source_formats.add(str(source_fmt))
+
+                ts = int(rec.get("token_start", 0))
+                te = int(rec.get("token_end", ts + int(k_raw.shape[0])))
+                valid_end = min(int(te), max(0, cached_tokens))
+                valid = max(
+                    0,
+                    min(
+                        int(chunk_size),
+                        int(k_raw.shape[0]),
+                        int(valid_end - ts),
+                    ),
+                )
+                if valid > 0:
+                    k_bucket[c, :valid].copy_(
+                        k_raw[:valid].to(dtype=torch.float32)
+                    )
+
+            q_block = _aissd_qk_calib_pack_q_block(
+                q_view[r],
+                int(num_heads),
+                int(num_kv_heads),
+                int(head_size),
+            )
+            k_flat = k_bucket.reshape(
+                bucket * chunk_size,
+                int(num_kv_heads) * int(head_size),
+            ).contiguous()
+
+            sample_dir = os.path.join(dump_dir, str(sample_idx))
+            os.makedirs(sample_dir, exist_ok=False)
+            _aissd_qk_calib_write_fp32(
+                os.path.join(sample_dir, "q_block.bin"), q_block
+            )
+            _aissd_qk_calib_write_fp32(
+                os.path.join(sample_dir, "k_flat.bin"), k_flat
+            )
+
+            q_stats = _aissd_qk_calib_stats(q_view[r])
+            k_stats = _aissd_qk_calib_stats(k_flat)
+            record = {
+                "sample": sample_idx,
+                "req_id": req_id,
+                "generation": generation,
+                "virtual_token_step": virtual_token_step,
+                "layer_id": int(layer_id),
+                "layer_name": str(layer_name),
+                "query_dtype": str(query.dtype),
+                "candidate_count": candidate_count,
+                "compiled_bucket": bucket,
+                "chunk_size": chunk_size,
+                "num_q_heads": int(num_heads),
+                "num_kv_heads": int(num_kv_heads),
+                "head_size": int(head_size),
+                "cached_tokens": cached_tokens,
+                "q_block_shape": [
+                    int(num_kv_heads) * int(head_size),
+                    int(num_heads),
+                ],
+                "k_flat_shape": [
+                    bucket * chunk_size,
+                    int(num_kv_heads) * int(head_size),
+                ],
+                "source_k_dtypes": sorted(source_k_dtypes),
+                "source_formats": sorted(source_formats),
+                "q_stats": q_stats,
+                "k_stats": k_stats,
+                "sample_dir": sample_dir,
+            }
+            with _AISSD_QK_CALIB_LOCK:
+                with open(manifest_path, "a", encoding="utf-8") as f:
+                    f.write(
+                        json.dumps(
+                            record, sort_keys=True, separators=(",", ":")
+                        )
+                        + "\n"
+                    )
+
+            logger.info(
+                "[aissd-qk-calib-dump] sample=%d layer=%d token_step=%d "
+                "req=%s candidates=%d bucket=%d q=[%.6g,%.6g] "
+                "k=[%.6g,%.6g] dir=%s",
+                sample_idx,
+                int(layer_id),
+                virtual_token_step,
+                req_id,
+                candidate_count,
+                bucket,
+                q_stats["min"],
+                q_stats["max"],
+                k_stats["min"],
+                k_stats["max"],
+                sample_dir,
+            )
+        except Exception:
+            with _AISSD_QK_CALIB_LOCK:
+                _AISSD_QK_CALIB_SEEN.discard(key)
+            raise
 
 
 def _aissd_selector_quality_dense_masses(
@@ -2305,6 +2663,30 @@ def _maybe_run_aissd_selector_op(
             tuple(query.shape),
             step_context.get("host_active_reqs"),
         )
+    # Calibration-only dense-baseline mode:
+    #   * capture real runtime Q + raw LMCache K for the NPU compiler;
+    #   * do NOT issue the SSD selector RPC (its result is irrelevant here);
+    #   * SparseSSDAttentionImpl.forward() will immediately use full/dense
+    #     FlashAttention after this function returns.
+    if _aissd_qk_calib_dense_baseline_enabled():
+        _aissd_maybe_dump_qk_calibration(
+            query=query,
+            step_context=step_context,
+            layer_name=layer_name,
+            layer_id=int(layer_id),
+            num_heads=int(num_heads),
+            num_kv_heads=int(num_kv_heads),
+            head_size=int(head_size),
+        )
+        logger.info_once(
+            "[aissd-qk-calib] dense-baseline capture active: "
+            "SSD selector RPC is skipped and full/dense attention is used"
+        )
+        step_context["aissd_selector_ms"] = 0.0
+        step_context["aissd_selector_reused"] = False
+        step_context["aissd_selector_real_layer"] = None
+        return 0.0
+
     t0 = time.perf_counter()
     selector_prof = _sparse_profile_begin("aissd_selector_op", layer_name, query)
     vllm_ops.aissd_sparse_kv_select(
@@ -2345,6 +2727,30 @@ def _maybe_run_aissd_selector_op(
         int(step_context.get("aissd_manifest_block_size", 4096)),
         int(step_context.get("aissd_timeout_ms", 300000)),
     )
+    if (
+        _aissd_qk_calib_dump_enabled()
+        and not _aissd_qk_calib_dense_baseline_enabled()
+    ):
+        try:
+            _aissd_maybe_dump_qk_calibration(
+                query=query,
+                step_context=step_context,
+                layer_name=layer_name,
+                layer_id=int(layer_id),
+                num_heads=int(num_heads),
+                num_kv_heads=int(num_kv_heads),
+                head_size=int(head_size),
+            )
+        except Exception as exc:
+            if _env_flag("AISSD_QK_CALIB_DUMP_STRICT", "1"):
+                raise
+            logger.warning(
+                "[aissd-qk-calib-dump] capture failed layer=%s error=%s",
+                layer_name,
+                exc,
+                exc_info=True,
+            )
+
     if _aissd_selector_quality_trace_enabled():
         try:
             _aissd_maybe_trace_selector_quality(
@@ -3308,6 +3714,23 @@ class SparseSSDAttentionImpl(AttentionImpl[AttentionMetadata]):
                     num_kv_heads=int(self.num_kv_heads),
                     attention_scale=float(self.scale),
                 )
+                if _aissd_qk_calib_dense_baseline_enabled():
+                    # Full LMCache retrieve was deliberately kept enabled by the
+                    # calibration-aware adapter.  Use the normal dense
+                    # FlashAttention implementation so later-layer Q tensors are
+                    # generated by the correct full-attention model, not by the
+                    # still-under-debug sparse selector.
+                    return self._fallback_forward(
+                        layer,
+                        query,
+                        key,
+                        value,
+                        kv_cache,
+                        attn_metadata,
+                        output,
+                        output_scale,
+                        output_block_scale,
+                    )
                 if impl in ("fa_varlen", "flash", "flash_attn", "flashattention"):
                     attn_t0 = time.perf_counter()
                     result = self._forward_sparse_fa_varlen(
