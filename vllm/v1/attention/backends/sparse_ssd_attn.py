@@ -329,6 +329,16 @@ def _aissd_selector_quality_trace_enabled() -> bool:
     return _env_flag("AISSD_SELECTOR_QUALITY_TRACE", "0")
 
 
+def _aissd_selector_quality_same_algo_enabled() -> bool:
+    """Whether to compare the SSD result with the exact CPU selector algorithm.
+
+    The comparison reuses the raw-Q/raw-K score tensors already produced for
+    the dense-attention oracle.  It therefore adds only the CPU aggregation and
+    ranking cost, not another round of LMCache K reads or QK matmuls.
+    """
+    return _env_flag("AISSD_SELECTOR_QUALITY_SAME_ALGO_REFERENCE", "1")
+
+
 def _aissd_selector_quality_reference_mode() -> str:
     """Return selector-quality oracle mode: production, fp32, or both.
 
@@ -937,7 +947,7 @@ def _aissd_selector_quality_dense_masses(
     scale: float,
     lmcache_cached_tokens: int,
     reference_mode: str,
-) -> tuple[list[float], dict[str, Any]]:
+) -> tuple[list[float], dict[str, Any], list[torch.Tensor]]:
     """Dense-attention chunk importance over the SSD candidate pool.
 
     production mode models low-precision production inputs followed by FP32
@@ -1057,7 +1067,242 @@ def _aissd_selector_quality_dense_masses(
                 "numerical_semantics": "fp32_compute_from_available_runtime_values",
             }
         )
-    return masses, meta
+    return masses, meta, score_chunks
+
+
+def _aissd_selector_quality_same_algo_name() -> str:
+    raw = str(
+        os.environ.get(
+            "AISSD_SPARSE_KV_SELECTOR_ALGO", "global_token_head_topm"
+        )
+    ).strip().lower()
+    aliases = {
+        "global_token_head_topm": "global_token_head_topm",
+        "flat_token_head_topm": "global_token_head_topm",
+        "token_headmax_topm": "token_headmax_topm",
+        "token_max_head_topm": "token_headmax_topm",
+    }
+    algo = aliases.get(raw)
+    if algo is None:
+        raise RuntimeError(
+            "selector-quality same-algorithm reference does not support "
+            f"AISSD_SPARSE_KV_SELECTOR_ALGO={raw!r}"
+        )
+    return algo
+
+
+def _aissd_selector_quality_same_algo_compact_chunks(
+    ids: list[int],
+    candidates: list[dict[str, Any]],
+    cpu_scores: list[float],
+    cpu_ranks: dict[int, int],
+) -> list[dict[str, Any]]:
+    out: list[dict[str, Any]] = []
+    for candidate_id in ids:
+        c = int(candidate_id)
+        if c < 0 or c >= len(candidates) or c >= len(cpu_scores):
+            continue
+        rec = candidates[c]
+        out.append(
+            {
+                "candidate_id": c,
+                "source_chunk_index": int(rec.get("source_chunk_index", c)),
+                "token_start": int(rec.get("token_start", 0)),
+                "token_end": int(rec.get("token_end", 0)),
+                "cpu_score": float(cpu_scores[c]),
+                "cpu_rank": int(cpu_ranks[c]),
+            }
+        )
+    return out
+
+
+def _aissd_selector_quality_same_algorithm(
+    score_chunks: list[torch.Tensor],
+    ssd_selected: list[int],
+    candidates: list[dict[str, Any]],
+    *,
+    top_n: int,
+    top_m: int,
+    score_mode_code: int,
+    chunk_size: int,
+    num_heads: int,
+) -> dict[str, Any]:
+    """Run the SSD plugin aggregation exactly on raw-Q/raw-K CPU scores.
+
+    The SSD NPU returns scaled QK scores in token-major [T,Hq] layout.  The
+    plugin then either:
+
+      * global_token_head_topm: flattens all T*Hq values, or
+      * token_headmax_topm: takes max over Hq for each token.
+
+    score_mode_code=0 is MAX; all other values follow the plugin's Top-M mean
+    branch.  Partial chunks are zero padded to the compiled chunk size, matching
+    the fixed-shape NPU input/output ABI.  Candidate ties are resolved by the
+    lower candidate id, exactly like cmp_qk_candidate_desc in the SSD plugin.
+    """
+    candidate_count = min(len(score_chunks), len(candidates))
+    if candidate_count <= 0:
+        raise RuntimeError("same-algorithm reference has no candidates")
+    if int(chunk_size) <= 0 or int(num_heads) <= 0:
+        raise RuntimeError(
+            "same-algorithm reference requires positive chunk_size/num_heads"
+        )
+
+    # [C,Hq,T].  Invalid rows are zero because the fixed-shape packed K ABI
+    # zero-pads them before the NPU MatMul.
+    padded = torch.zeros(
+        (candidate_count, int(num_heads), int(chunk_size)),
+        dtype=torch.float32,
+    )
+    valid_lengths: list[int] = []
+    for c, scores in enumerate(score_chunks[:candidate_count]):
+        if not isinstance(scores, torch.Tensor) or scores.dim() != 2:
+            raise RuntimeError(
+                f"same-algorithm bad score tensor candidate={c}: "
+                f"type={type(scores)} shape={getattr(scores, 'shape', None)}"
+            )
+        if int(scores.shape[0]) != int(num_heads):
+            raise RuntimeError(
+                "same-algorithm score head mismatch candidate="
+                f"{c} got={int(scores.shape[0])} expected={int(num_heads)}"
+            )
+        valid = min(int(chunk_size), int(scores.shape[1]))
+        valid_lengths.append(valid)
+        if valid > 0:
+            padded[c, :, :valid].copy_(scores[:, :valid].to(torch.float32))
+
+    if not bool(torch.isfinite(padded).all().item()):
+        raise RuntimeError("same-algorithm reference encountered non-finite QK")
+
+    algo = _aissd_selector_quality_same_algo_name()
+    if algo == "token_headmax_topm":
+        reduced = padded.max(dim=1).values  # [C,T]
+    else:
+        reduced = padded.reshape(candidate_count, int(num_heads) * int(chunk_size))
+
+    reduce_width = int(reduced.shape[1])
+    effective_top_m = int(top_m)
+    if effective_top_m <= 0 or effective_top_m > reduce_width:
+        effective_top_m = reduce_width
+
+    if int(score_mode_code) == 0:
+        candidate_scores_t = reduced.max(dim=1).values.to(torch.float32)
+        score_mode = "max"
+    else:
+        # The plugin accumulates sorted float values in double and casts the
+        # mean back to float.  FP64 reduction followed by FP32 cast mirrors it.
+        top_values = torch.topk(
+            reduced,
+            k=effective_top_m,
+            dim=1,
+            largest=True,
+            sorted=False,
+        ).values
+        candidate_scores_t = (
+            top_values.to(torch.float64).sum(dim=1) / float(effective_top_m)
+        ).to(torch.float32)
+        score_mode = "topm_mean"
+
+    cpu_scores = [float(x) for x in candidate_scores_t.tolist()]
+    ranking = sorted(range(candidate_count), key=lambda c: (-cpu_scores[c], c))
+    cpu_ranks = {int(c): int(rank + 1) for rank, c in enumerate(ranking)}
+    oracle_k = min(max(1, int(top_n)), candidate_count)
+    cpu_topn = [int(c) for c in ranking[:oracle_k]]
+
+    ssd_ids: list[int] = []
+    seen: set[int] = set()
+    for raw in ssd_selected:
+        c = int(raw)
+        if 0 <= c < candidate_count and c not in seen:
+            seen.add(c)
+            ssd_ids.append(c)
+
+    overlap = set(cpu_topn).intersection(ssd_ids)
+    prefix_match = 0
+    for cpu_id, ssd_id in zip(cpu_topn, ssd_ids):
+        if int(cpu_id) != int(ssd_id):
+            break
+        prefix_match += 1
+
+    cpu_positions = {c: i for i, c in enumerate(cpu_topn)}
+    ssd_positions = {c: i for i, c in enumerate(ssd_ids)}
+    common_displacements = [
+        abs(int(cpu_positions[c]) - int(ssd_positions[c])) for c in overlap
+    ]
+    selected_ranks = [cpu_ranks[c] for c in ssd_ids]
+
+    cpu_oracle_score_sum = float(sum(cpu_scores[c] for c in cpu_topn))
+    ssd_selected_cpu_score_sum = float(sum(cpu_scores[c] for c in ssd_ids))
+    cpu_oracle_score_mean = cpu_oracle_score_sum / float(len(cpu_topn))
+    ssd_selected_cpu_score_mean = (
+        ssd_selected_cpu_score_sum / float(len(ssd_ids)) if ssd_ids else 0.0
+    )
+    cpu_score_regret = float(
+        cpu_oracle_score_mean - ssd_selected_cpu_score_mean
+    )
+    normalized_regret = float(
+        cpu_score_regret / max(abs(cpu_oracle_score_mean), 1.0e-12)
+    )
+    boundary_margin = (
+        float(cpu_scores[ranking[oracle_k - 1]] - cpu_scores[ranking[oracle_k]])
+        if candidate_count > oracle_k
+        else None
+    )
+
+    result: dict[str, Any] = {
+        "algorithm": algo,
+        "score_mode": score_mode,
+        "score_mode_code": int(score_mode_code),
+        "top_n": int(oracle_k),
+        "top_m": int(effective_top_m),
+        "reduce_width": int(reduce_width),
+        "chunk_size": int(chunk_size),
+        "num_q_heads": int(num_heads),
+        "qk_scale_applied": True,
+        "partial_chunk_padding": "zero_to_compiled_chunk_size",
+        "valid_token_lengths": valid_lengths,
+        "cpu_topn": _aissd_selector_quality_same_algo_compact_chunks(
+            cpu_topn, candidates, cpu_scores, cpu_ranks
+        ),
+        "ssd_topn_with_cpu_scores": (
+            _aissd_selector_quality_same_algo_compact_chunks(
+                ssd_ids, candidates, cpu_scores, cpu_ranks
+            )
+        ),
+        "cpu_topn_ids": cpu_topn,
+        "ssd_topn_candidate_ids": ssd_ids,
+        "topn_overlap_count": int(len(overlap)),
+        "topn_recall": float(len(overlap)) / float(oracle_k),
+        "exact_set_match": bool(
+            len(ssd_ids) == oracle_k and set(ssd_ids) == set(cpu_topn)
+        ),
+        "exact_order_match": bool(ssd_ids == cpu_topn),
+        "prefix_match_count": int(prefix_match),
+        "common_rank_displacement_mean": (
+            float(sum(common_displacements)) / float(len(common_displacements))
+            if common_displacements
+            else None
+        ),
+        "ssd_selected_cpu_rank_mean": (
+            float(sum(selected_ranks)) / float(len(selected_ranks))
+            if selected_ranks
+            else None
+        ),
+        "ssd_selected_cpu_rank_worst": (
+            int(max(selected_ranks)) if selected_ranks else None
+        ),
+        "cpu_oracle_score_mean": float(cpu_oracle_score_mean),
+        "ssd_selected_cpu_score_mean": float(ssd_selected_cpu_score_mean),
+        "cpu_score_regret": float(cpu_score_regret),
+        "cpu_score_regret_normalized": float(normalized_regret),
+        "cpu_topn_boundary_margin": boundary_margin,
+        "cpu_chunk_score_min": float(min(cpu_scores)),
+        "cpu_chunk_score_max": float(max(cpu_scores)),
+        "cpu_chunk_score_mean": float(sum(cpu_scores) / len(cpu_scores)),
+    }
+    if _env_flag("AISSD_SELECTOR_QUALITY_SAME_ALGO_STORE_ALL_SCORES", "0"):
+        result["cpu_chunk_scores"] = cpu_scores
+    return result
 
 
 def _aissd_selector_quality_metrics(
@@ -1280,6 +1525,11 @@ def _aissd_maybe_trace_selector_quality(
     selected_lens_cpu = selected_lens_t.detach().to("cpu")
     cached_tokens_cpu = cached_tokens_t.detach().to("cpu")
     top_n = max(1, int(step_context.get("top_n_chunks", 1) or 1))
+    raw_top_m = step_context.get("aissd_top_m", 8)
+    top_m = 8 if raw_top_m is None else int(raw_top_m)
+    raw_score_mode = step_context.get("aissd_score_mode_code", 1)
+    score_mode_code = 1 if raw_score_mode is None else int(raw_score_mode)
+    chunk_size = int(step_context.get("chunk_size", 0) or 0)
     trace_tag = str(os.environ.get("AISSD_SELECTOR_QUALITY_TRACE_TAG", ""))
 
     for r in range(active_reqs):
@@ -1330,7 +1580,7 @@ def _aissd_maybe_trace_selector_quality(
         )
         references: dict[str, dict[str, Any]] = {}
         for mode in modes:
-            masses, ref_meta = _aissd_selector_quality_dense_masses(
+            masses, ref_meta, score_chunks = _aissd_selector_quality_dense_masses(
                 q_view[r],
                 candidates,
                 layer_id=int(layer_id),
@@ -1347,14 +1597,31 @@ def _aissd_maybe_trace_selector_quality(
                 candidates,
                 top_n,
             )
-            references[mode] = {**ref_meta, **metrics}
+            same_algorithm = None
+            if _aissd_selector_quality_same_algo_enabled():
+                same_algorithm = _aissd_selector_quality_same_algorithm(
+                    score_chunks,
+                    ssd_selected,
+                    candidates,
+                    top_n=int(top_n),
+                    top_m=int(top_m),
+                    score_mode_code=int(score_mode_code),
+                    chunk_size=int(chunk_size),
+                    num_heads=int(num_heads),
+                )
+            references[mode] = {
+                **ref_meta,
+                **metrics,
+                "same_algorithm": same_algorithm,
+            }
 
         # Production is the primary ground truth whenever it was requested.
         primary_mode = "production" if "production" in references else "fp32"
         primary = references[primary_mode]
         elapsed_ms = (time.perf_counter() - t0) * 1000.0
+        same_algorithm_primary = primary.get("same_algorithm")
         record = {
-            "schema_version": 3,
+            "schema_version": 4,
             "tag": trace_tag,
             "req_id": req_id,
             "request_ordinal": int(req_ordinal),
@@ -1383,9 +1650,31 @@ def _aissd_maybe_trace_selector_quality(
             "oracle_mass": float(primary["oracle_mass"]),
             "selection_regret": float(primary["selection_regret"]),
             "candidate_mass_sum": float(primary["candidate_mass_sum"]),
+            # Primary-mode alias for NPU-vs-CPU exact-selector comparison.
+            "same_algorithm_reference": same_algorithm_primary,
             "lmcache_cached_tokens": int(cached_tokens),
             "trace_elapsed_ms": float(elapsed_ms),
         }
+        if isinstance(same_algorithm_primary, dict):
+            record.update(
+                {
+                    "same_algo_topn_recall": float(
+                        same_algorithm_primary["topn_recall"]
+                    ),
+                    "same_algo_exact_set_match": bool(
+                        same_algorithm_primary["exact_set_match"]
+                    ),
+                    "same_algo_exact_order_match": bool(
+                        same_algorithm_primary["exact_order_match"]
+                    ),
+                    "same_algo_cpu_score_regret": float(
+                        same_algorithm_primary["cpu_score_regret"]
+                    ),
+                    "same_algo_cpu_score_regret_normalized": float(
+                        same_algorithm_primary["cpu_score_regret_normalized"]
+                    ),
+                }
+            )
         _aissd_selector_quality_append_json(record)
         logger.info(
             "[aissd-selector-quality] req=%s decode_step=%d layer=%d candidates=%d "
@@ -1407,6 +1696,30 @@ def _aissd_maybe_trace_selector_quality(
             float(primary["selection_regret"]),
             elapsed_ms,
         )
+        if isinstance(same_algorithm_primary, dict):
+            logger.info(
+                "[aissd-selector-same-algo] req=%s decode_step=%d layer=%d "
+                "algo=%s score_mode=%s top_m=%d overlap=%d/%d recall=%.6f "
+                "exact_set=%s exact_order=%s prefix=%d selected_cpu_rank_mean=%s "
+                "cpu_score_regret=%.9g normalized_regret=%.9g cpu_topn=%s ssd_topn=%s",
+                req_id,
+                decode_step,
+                int(layer_id),
+                str(same_algorithm_primary["algorithm"]),
+                str(same_algorithm_primary["score_mode"]),
+                int(same_algorithm_primary["top_m"]),
+                int(same_algorithm_primary["topn_overlap_count"]),
+                int(same_algorithm_primary["top_n"]),
+                float(same_algorithm_primary["topn_recall"]),
+                bool(same_algorithm_primary["exact_set_match"]),
+                bool(same_algorithm_primary["exact_order_match"]),
+                int(same_algorithm_primary["prefix_match_count"]),
+                same_algorithm_primary["ssd_selected_cpu_rank_mean"],
+                float(same_algorithm_primary["cpu_score_regret"]),
+                float(same_algorithm_primary["cpu_score_regret_normalized"]),
+                same_algorithm_primary["cpu_topn_ids"],
+                same_algorithm_primary["ssd_topn_candidate_ids"],
+            )
         if requested_mode == "both":
             prod = references["production"]
             f32 = references["fp32"]
