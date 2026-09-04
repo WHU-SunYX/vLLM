@@ -1041,6 +1041,407 @@ def _aissd_selector_quality_build_k_layout_trace(
     }
 
 
+def _aissd_selector_quality_q_layout_trace_enabled() -> bool:
+    return _env_flag("AISSD_SELECTOR_QUALITY_Q_LAYOUT_TRACE", "0")
+
+
+def _aissd_selector_quality_q_layout_trace_matches(
+    *,
+    request_ordinal: int,
+    decode_step: int,
+    layer_id: int,
+) -> bool:
+    if not _aissd_selector_quality_q_layout_trace_enabled():
+        return False
+    return (
+        int(request_ordinal)
+        == _aissd_env_int("AISSD_SELECTOR_QUALITY_Q_LAYOUT_TRACE_REQUEST", 0)
+        and int(decode_step)
+        == _aissd_env_int(
+            "AISSD_SELECTOR_QUALITY_Q_LAYOUT_TRACE_DECODE_STEP", 0
+        )
+        and int(layer_id)
+        == _aissd_env_int("AISSD_SELECTOR_QUALITY_Q_LAYOUT_TRACE_LAYER", 0)
+    )
+
+
+def _aissd_selector_quality_q_layout_coords(
+    num_heads: int,
+    head_size: int,
+) -> list[tuple[int, int]]:
+    raw = str(
+        os.environ.get("AISSD_SELECTOR_QUALITY_Q_LAYOUT_TRACE_COORDS", "")
+    ).strip()
+    if raw:
+        coords: list[tuple[int, int]] = []
+        for item in raw.split(","):
+            parts = [part.strip() for part in item.strip().split(":")]
+            if len(parts) != 2:
+                raise RuntimeError(
+                    "AISSD_SELECTOR_QUALITY_Q_LAYOUT_TRACE_COORDS entries must "
+                    f"be q_head:dim, got {item!r}"
+                )
+            coords.append((int(parts[0]), int(parts[1])))
+    else:
+        last_head = max(0, int(num_heads) - 1)
+        last_dim = max(0, int(head_size) - 1)
+        coords = [
+            (0, 0),
+            (0, last_dim),
+            (min(3, last_head), min(61, last_dim)),
+            (min(4, last_head), 0),
+            (min(15, last_head), last_dim),
+            (min(16, last_head), 0),
+            (min(28, last_head), min(63, last_dim)),
+            (last_head, last_dim),
+        ]
+
+    result: list[tuple[int, int]] = []
+    seen: set[tuple[int, int]] = set()
+    for coord in coords:
+        q_head, dim = coord
+        if not (
+            0 <= q_head < int(num_heads)
+            and 0 <= dim < int(head_size)
+        ):
+            raise RuntimeError(
+                "Q-layout trace coordinate out of range: "
+                f"coord={coord} shape=({num_heads},{head_size})"
+            )
+        if coord not in seen:
+            seen.add(coord)
+            result.append(coord)
+    return result
+
+
+def _aissd_selector_quality_fnv1a64_bytes(data: bytes) -> str:
+    # Match the project's existing q-trace/cache FNV offset basis exactly.
+    value = 1469598103934665603
+    for byte in data:
+        value ^= int(byte)
+        value = (value * 1099511628211) & 0xFFFFFFFFFFFFFFFF
+    return f"0x{value:016x}"
+
+
+def _aissd_selector_quality_write_trace_bytes(path: str, data: bytes) -> None:
+    parent = os.path.dirname(path)
+    if parent:
+        os.makedirs(parent, exist_ok=True)
+    tmp = path + f".tmp.{os.getpid()}.{threading.get_ident()}"
+    with open(tmp, "wb") as f:
+        f.write(data)
+        f.flush()
+        os.fsync(f.fileno())
+    os.replace(tmp, path)
+
+
+def _aissd_selector_quality_q_layout_abi(
+    candidates: list[dict[str, Any]],
+) -> dict[str, Any]:
+    candidate = candidates[0] if candidates else {}
+    selector_path = str(candidate.get("selector_path") or "")
+    sidecar_header: dict[str, Any] = {}
+    if (
+        selector_path
+        and "..aissd_qkpack." in selector_path
+        and os.path.isfile(selector_path)
+    ):
+        sidecar_header = _aissd_selector_quality_read_qkpack_header(
+            selector_path
+        )
+
+    abi_path = str(
+        os.environ.get(
+            "AISSD_SELECTOR_QUALITY_Q_LAYOUT_ABI_PATH",
+            os.environ.get("AISSD_QKPACK_ABI", ""),
+        )
+    ).strip()
+    if not abi_path:
+        abi_path = str(sidecar_header.get("abi_path") or "").strip()
+    if not abi_path:
+        raise RuntimeError(
+            "Q-layout trace cannot resolve ABI JSON; set "
+            "AISSD_SELECTOR_QUALITY_Q_LAYOUT_ABI_PATH"
+        )
+    if not os.path.isfile(abi_path):
+        raise RuntimeError(f"Q-layout trace ABI JSON does not exist: {abi_path}")
+
+    with open(abi_path, "r", encoding="utf-8") as f:
+        abi = json.load(f)
+    if not isinstance(abi, dict):
+        raise RuntimeError(f"Q-layout trace ABI root is not an object: {abi_path}")
+
+    default_bucket = int(
+        candidate.get("qkpack_bucket", 0)
+        or sidecar_header.get("bucket", 0)
+        or abi.get("reference_bucket", 128)
+    )
+    bucket = _aissd_env_int(
+        "AISSD_SELECTOR_QUALITY_Q_LAYOUT_TRACE_BUCKET", default_bucket
+    )
+    bucket_info = (abi.get("buckets") or {}).get(str(bucket))
+    if not isinstance(bucket_info, dict):
+        raise RuntimeError(
+            f"Q-layout trace ABI has no bucket c{bucket}: {abi_path}"
+        )
+    qinfo = bucket_info.get("q_block")
+    if not isinstance(qinfo, dict):
+        raise RuntimeError(
+            f"Q-layout trace ABI bucket c{bucket} has no q_block metadata"
+        )
+
+    return {
+        "source": "abi_json",
+        "source_path": os.path.abspath(abi_path),
+        "bucket": int(bucket),
+        "tensor_name": str(qinfo.get("tensor_name", "q_block")),
+        "tensor_bank": int(qinfo.get("tensor_bank", 0)),
+        "tensor_bank_offset": int(qinfo.get("tensor_bank_offset", 0)),
+        "tensor_precision": int(qinfo.get("tensor_precision", 0)),
+        "tensor_type": str(qinfo.get("tensor_type", "")),
+        "tensor_width": int(qinfo.get("tensor_width", 0)),
+        "tensor_ori_channels": int(qinfo.get("tensor_ori_channels", 0)),
+        "tensor_memory_size": int(qinfo.get("tensor_memory_size", 0)),
+        "tensor_row_ddr_step": int(qinfo.get("tensor_row_ddr_step", 0)),
+        "scale": float(qinfo.get("tensor_scale_factor", 0.0)),
+        "zero_point": int(qinfo.get("tensor_zero_point", 0)),
+    }
+
+
+def _aissd_selector_quality_build_q_layout_trace(
+    *,
+    req_id: str,
+    request_ordinal: int,
+    decode_step: int,
+    layer_id: int,
+    q_row: torch.Tensor,
+    candidates: list[dict[str, Any]],
+    num_heads: int,
+    num_kv_heads: int,
+    head_size: int,
+) -> dict[str, Any]:
+    hq = int(num_heads)
+    hkv = int(num_kv_heads)
+    dim = int(head_size)
+    if hq <= 0 or hkv <= 0 or dim <= 0 or hq % hkv != 0:
+        raise RuntimeError(
+            f"Q-layout trace has invalid GQA shape Hq={hq} Hkv={hkv} D={dim}"
+        )
+
+    quant = _aissd_selector_quality_q_layout_abi(candidates)
+    if quant["tensor_precision"] != 16 or str(
+        quant["tensor_type"]
+    ).lower() not in ("", "integer"):
+        raise RuntimeError(
+            "Q-layout trace currently requires an INT16 q_block, got "
+            f"precision={quant['tensor_precision']} type={quant['tensor_type']!r}"
+        )
+    if not (float(quant["scale"]) > 0.0):
+        raise RuntimeError(
+            f"Q-layout trace requires positive q_block scale, got {quant['scale']}"
+        )
+
+    q_rows = hkv * dim
+    q_cols = hq
+    if int(quant["tensor_width"]) != q_cols:
+        raise RuntimeError(
+            "Q-layout trace q_block width mismatch: "
+            f"ABI={quant['tensor_width']} expected={q_cols}"
+        )
+    if int(quant["tensor_ori_channels"]) != q_rows:
+        raise RuntimeError(
+            "Q-layout trace q_block channel mismatch: "
+            f"ABI={quant['tensor_ori_channels']} expected={q_rows}"
+        )
+
+    physical_bytes = int(quant["tensor_memory_size"])
+    row_stride_bytes = int(quant["tensor_row_ddr_step"]) or q_rows * 2
+    if physical_bytes <= 0 or physical_bytes % 2:
+        raise RuntimeError(
+            f"Q-layout trace invalid physical q_block bytes={physical_bytes}"
+        )
+    column_major = (
+        row_stride_bytes >= q_rows * 2
+        and physical_bytes >= q_cols * row_stride_bytes
+    )
+    if column_major:
+        physical_layout = "q_head_major_rows"
+        physical_required = q_cols * row_stride_bytes
+    else:
+        physical_layout = "logical_row_major"
+        physical_required = q_rows * q_cols * 2
+    if physical_bytes < physical_required:
+        raise RuntimeError(
+            "Q-layout trace physical q_block is too small: "
+            f"bytes={physical_bytes} required={physical_required} "
+            f"layout={physical_layout}"
+        )
+
+    # Keep the source storage exactly as sent to the RPC (normally BF16
+    # [num_q_heads, head_size]), then independently rebuild the compiler's
+    # complete physical INT16 q_block including structural zero-point slots.
+    q_cpu = q_row.detach().to(device="cpu").reshape(hq, dim).contiguous()
+    source_storage = q_cpu.view(torch.uint8).numpy().tobytes()
+    source_values = q_cpu.to(dtype=torch.float64)
+    inv_scale = 1.0 / float(quant["scale"])
+    rounded = torch.round(source_values * inv_scale).to(torch.int64)
+    rounded = rounded + int(quant["zero_point"])
+    clamped_low = int((rounded < -32768).sum().item())
+    clamped_high = int((rounded > 32767).sum().item())
+    quantized = rounded.clamp(-32768, 32767).to(torch.int16).contiguous()
+
+    physical_i16 = physical_bytes // 2
+    zero_point = int(quant["zero_point"])
+    if not (-32768 <= zero_point <= 32767):
+        raise RuntimeError(
+            f"Q-layout trace INT16 zero_point out of range: {zero_point}"
+        )
+    payload = bytearray(struct.pack("<h", zero_point) * physical_i16)
+    active_indices: set[int] = set()
+    q_per_kv = hq // hkv
+    for q_head in range(hq):
+        kv_head = q_head // q_per_kv
+        for d in range(dim):
+            logical_row = kv_head * dim + d
+            if column_major:
+                byte_offset = q_head * row_stride_bytes + logical_row * 2
+            else:
+                byte_offset = (logical_row * q_cols + q_head) * 2
+            if byte_offset < 0 or byte_offset + 2 > physical_bytes:
+                raise RuntimeError(
+                    "Q-layout trace active coordinate exceeds q_block: "
+                    f"q_head={q_head} dim={d} byte_offset={byte_offset} "
+                    f"bytes={physical_bytes}"
+                )
+            physical_index = byte_offset // 2
+            if physical_index in active_indices:
+                raise RuntimeError(
+                    "Q-layout trace physical mapping collision at "
+                    f"q_head={q_head} dim={d} index={physical_index}"
+                )
+            active_indices.add(physical_index)
+            struct.pack_into(
+                "<h", payload, byte_offset, int(quantized[q_head, d].item())
+            )
+
+    expected_payload = bytes(payload)
+    coords = _aissd_selector_quality_q_layout_coords(hq, dim)
+    coordinate_records: list[dict[str, Any]] = []
+    source_elem_bytes = int(q_cpu.element_size())
+    for q_head, d in coords:
+        kv_head = q_head // q_per_kv
+        group = q_head % q_per_kv
+        logical_row = kv_head * dim + d
+        logical_col = q_head
+        source_flat_index = q_head * dim + d
+        source_byte_offset = source_flat_index * source_elem_bytes
+        if column_major:
+            physical_byte_offset = q_head * row_stride_bytes + logical_row * 2
+        else:
+            physical_byte_offset = (logical_row * q_cols + q_head) * 2
+        expected_i16 = int(
+            struct.unpack_from("<h", expected_payload, physical_byte_offset)[0]
+        )
+        coordinate_records.append(
+            {
+                "q_head": int(q_head),
+                "dim": int(d),
+                "kv_head": int(kv_head),
+                "q_group_within_kv_head": int(group),
+                "source_flat_index": int(source_flat_index),
+                "source_byte_offset": int(source_byte_offset),
+                "source_storage_hex_le": source_storage[
+                    source_byte_offset : source_byte_offset + source_elem_bytes
+                ].hex(),
+                "source_value": float(q_cpu[q_head, d].item()),
+                "logical_q_block_row": int(logical_row),
+                "logical_q_block_col": int(logical_col),
+                "physical_int16_index": int(physical_byte_offset // 2),
+                "physical_byte_offset": int(physical_byte_offset),
+                "expected_packed_int16": int(expected_i16),
+                "expected_dequantized": float(
+                    (expected_i16 - zero_point) * float(quant["scale"])
+                ),
+            }
+        )
+
+    dump_dir = str(
+        os.environ.get("AISSD_SELECTOR_QUALITY_Q_LAYOUT_DUMP_DIR", "")
+    ).strip()
+    source_dump_path = None
+    expected_dump_path = None
+    if dump_dir:
+        dump_dir = os.path.abspath(dump_dir)
+        stem = (
+            f"req{int(request_ordinal)}.step{int(decode_step)}."
+            f"l{int(layer_id)}.bucket{int(quant['bucket'])}"
+        )
+        source_dump_path = os.path.join(
+            dump_dir, f"aissd_qpack_expected.source.{stem}.bin"
+        )
+        expected_dump_path = os.path.join(
+            dump_dir, f"aissd_qpack_expected.physical.{stem}.int16.bin"
+        )
+        _aissd_selector_quality_write_trace_bytes(
+            source_dump_path, source_storage
+        )
+        _aissd_selector_quality_write_trace_bytes(
+            expected_dump_path, expected_payload
+        )
+
+    return {
+        "schema_version": 1,
+        "record_type": "aissd_selector_q_layout_trace",
+        "req_id": str(req_id),
+        "request_ordinal": int(request_ordinal),
+        "decode_step": int(decode_step),
+        "layer_id": int(layer_id),
+        "bucket": int(quant["bucket"]),
+        "num_q_heads": hq,
+        "num_kv_heads": hkv,
+        "head_size": dim,
+        "q_per_kv_head": int(q_per_kv),
+        "source_dtype": str(q_cpu.dtype),
+        "source_shape": [int(x) for x in q_cpu.shape],
+        "source_stride_elements": [int(x) for x in q_cpu.stride()],
+        "source_contiguous": bool(q_cpu.is_contiguous()),
+        "source_element_bytes": int(source_elem_bytes),
+        "source_bytes": len(source_storage),
+        "source_sha256": hashlib.sha256(source_storage).hexdigest(),
+        "source_fnv1a64": _aissd_selector_quality_fnv1a64_bytes(
+            source_storage
+        ),
+        "logical_q_block_shape": [q_rows, q_cols],
+        "logical_mapping_formula": (
+            "row=(q_head//q_per_kv_head)*head_size+dim; col=q_head"
+        ),
+        "physical_layout": physical_layout,
+        "physical_offset_formula": (
+            "q_head*row_stride_bytes+logical_row*2"
+            if column_major
+            else "(logical_row*num_q_heads+q_head)*2"
+        ),
+        "physical_bytes": int(physical_bytes),
+        "row_stride_bytes": int(row_stride_bytes),
+        "active_value_count": len(active_indices),
+        "structural_fill_count": int(physical_i16 - len(active_indices)),
+        "structural_fill_int16": int(zero_point),
+        "quantization": quant,
+        "quantization_formula": (
+            "clamp_int16(lrint(float(source)*inverse_scale)+zero_point)"
+        ),
+        "quantized_clamped_low_count": int(clamped_low),
+        "quantized_clamped_high_count": int(clamped_high),
+        "expected_packed_sha256": hashlib.sha256(expected_payload).hexdigest(),
+        "expected_packed_fnv1a64": _aissd_selector_quality_fnv1a64_bytes(
+            expected_payload
+        ),
+        "source_dump_path": source_dump_path,
+        "expected_packed_dump_path": expected_dump_path,
+        "coordinates": coordinate_records,
+    }
+
+
 def _aissd_qk_calib_dump_enabled() -> bool:
     return _env_flag("AISSD_QK_CALIB_DUMP", "0")
 
@@ -2043,6 +2444,23 @@ def _aissd_maybe_trace_selector_quality(
                 num_kv_heads=int(num_kv_heads),
                 head_size=int(head_size),
             )
+        q_layout_trace = None
+        if _aissd_selector_quality_q_layout_trace_matches(
+            request_ordinal=int(req_ordinal),
+            decode_step=int(decode_step),
+            layer_id=int(layer_id),
+        ):
+            q_layout_trace = _aissd_selector_quality_build_q_layout_trace(
+                req_id=req_id,
+                request_ordinal=int(req_ordinal),
+                decode_step=int(decode_step),
+                layer_id=int(layer_id),
+                q_row=q_view[r],
+                candidates=candidates,
+                num_heads=int(num_heads),
+                num_kv_heads=int(num_kv_heads),
+                head_size=int(head_size),
+            )
         requested_mode = _aissd_selector_quality_reference_mode()
         modes = (
             ("production", "fp32")
@@ -2128,6 +2546,8 @@ def _aissd_maybe_trace_selector_quality(
         }
         if isinstance(k_layout_trace, dict):
             record["k_layout_trace"] = k_layout_trace
+        if isinstance(q_layout_trace, dict):
+            record["q_layout_trace"] = q_layout_trace
         if isinstance(same_algorithm_primary, dict):
             record.update(
                 {
