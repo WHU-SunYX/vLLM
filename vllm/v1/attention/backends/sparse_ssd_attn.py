@@ -16,6 +16,7 @@ mode where full KV remains available.
 
 from typing import Any
 import copy
+import hashlib
 import json
 import os
 import struct
@@ -484,6 +485,8 @@ def _aissd_selector_quality_read_source_k(
     layer_id: int,
     num_kv_heads: int,
     head_size: int,
+    *,
+    layout_info: dict[str, Any] | None = None,
 ) -> tuple[torch.Tensor, torch.dtype, str]:
     """Read one raw LMCache K layer as CPU [T,Hkv,D], preserving source dtype.
 
@@ -583,7 +586,459 @@ def _aissd_selector_quality_read_source_k(
         os.close(fd)
 
     k = k.reshape(int(k.shape[0]), int(num_kv_heads), int(head_size)).contiguous()
+    if layout_info is not None:
+        layout_info.clear()
+        layout_info.update(
+            {
+                "metadata_bytes": int(metadata_bytes),
+                "source_tensor_shape": shape,
+                "source_tensor_dtype": str(dtype),
+                "source_format": str(fmt),
+                "source_element_bytes": int(elem_bytes),
+                "cpu_k_shape": [int(x) for x in k.shape],
+                "cpu_k_stride_elements": [int(x) for x in k.stride()],
+                "cpu_k_contiguous": bool(k.is_contiguous()),
+            }
+        )
     return k, dtype, fmt
+
+
+def _aissd_selector_quality_k_layout_trace_enabled() -> bool:
+    return _env_flag("AISSD_SELECTOR_QUALITY_K_LAYOUT_TRACE", "0")
+
+
+def _aissd_selector_quality_k_layout_trace_matches(
+    *,
+    request_ordinal: int,
+    decode_step: int,
+    layer_id: int,
+) -> bool:
+    if not _aissd_selector_quality_k_layout_trace_enabled():
+        return False
+    return (
+        int(request_ordinal)
+        == _aissd_env_int("AISSD_SELECTOR_QUALITY_K_LAYOUT_TRACE_REQUEST", 0)
+        and int(decode_step)
+        == _aissd_env_int("AISSD_SELECTOR_QUALITY_K_LAYOUT_TRACE_DECODE_STEP", 0)
+        and int(layer_id)
+        == _aissd_env_int("AISSD_SELECTOR_QUALITY_K_LAYOUT_TRACE_LAYER", 0)
+    )
+
+
+def _aissd_selector_quality_k_layout_coords(
+    tokens: int,
+    num_kv_heads: int,
+    head_size: int,
+) -> list[tuple[int, int, int]]:
+    raw = str(
+        os.environ.get("AISSD_SELECTOR_QUALITY_K_LAYOUT_TRACE_COORDS", "")
+    ).strip()
+    if raw:
+        coords: list[tuple[int, int, int]] = []
+        for item in raw.split(","):
+            parts = [part.strip() for part in item.strip().split(":")]
+            if len(parts) != 3:
+                raise RuntimeError(
+                    "AISSD_SELECTOR_QUALITY_K_LAYOUT_TRACE_COORDS entries must "
+                    f"be token:kv_head:dim, got {item!r}"
+                )
+            coords.append((int(parts[0]), int(parts[1]), int(parts[2])))
+    else:
+        last_token = max(0, min(127, int(tokens) - 1))
+        last_head = max(0, int(num_kv_heads) - 1)
+        last_dim = max(0, int(head_size) - 1)
+        coords = [
+            (0, 0, 0),
+            (0, 0, last_dim),
+            (0, min(1, last_head), 0),
+            (0, last_head, last_dim),
+            (min(1, last_token), 0, 0),
+            (min(17, last_token), min(3, last_head), min(61, last_dim)),
+            (min(63, last_token), min(4, last_head), 0),
+            (last_token, last_head, last_dim),
+        ]
+
+    result: list[tuple[int, int, int]] = []
+    seen: set[tuple[int, int, int]] = set()
+    for coord in coords:
+        token, kv_head, dim = coord
+        if not (
+            0 <= token < int(tokens)
+            and 0 <= kv_head < int(num_kv_heads)
+            and 0 <= dim < int(head_size)
+        ):
+            raise RuntimeError(
+                "K-layout trace coordinate out of range: "
+                f"coord={coord} shape=({tokens},{num_kv_heads},{head_size})"
+            )
+        if coord not in seen:
+            seen.add(coord)
+            result.append(coord)
+    return result
+
+
+def _aissd_selector_quality_source_k_file_offset(
+    *,
+    source_format: str,
+    source_shape: list[int],
+    metadata_bytes: int,
+    element_bytes: int,
+    layer_id: int,
+    token: int,
+    kv_head: int,
+    dim: int,
+    num_kv_heads: int,
+    head_size: int,
+) -> int:
+    hidden = int(num_kv_heads) * int(head_size)
+    hd = int(kv_head) * int(head_size) + int(dim)
+    fmt = str(source_format)
+    if fmt == "KV_2LTD":
+        _, layers, tokens, width = source_shape
+        linear = ((int(layer_id) * int(tokens) + int(token)) * int(width)) + hd
+    elif fmt == "KV_T2D":
+        _, tokens, width = source_shape
+        linear = int(token) * int(width) + hd
+    elif fmt == "KV_2TD":
+        tokens, kv, width = source_shape
+        linear = (int(token) * int(kv)) * int(width) + hd
+    elif fmt in ("K_ONLY_THD", "K_THD", "K_ONLY_TD"):
+        linear = int(token) * hidden + hd
+    else:
+        raise RuntimeError(f"unsupported K-layout trace source format={fmt!r}")
+    return int(metadata_bytes) + int(linear) * int(element_bytes)
+
+
+def _aissd_selector_quality_read_qkpack_header(path: str) -> dict[str, Any]:
+    fd = os.open(path, os.O_RDONLY)
+    try:
+        raw = _aissd_selector_quality_read_exact(fd, 4096, 0)
+    finally:
+        os.close(fd)
+    text = raw.split(b"\0", 1)[0].strip()
+    if not text:
+        return {}
+    try:
+        header = json.loads(text.decode("utf-8"))
+    except Exception:
+        return {}
+    return header if isinstance(header, dict) else {}
+
+
+def _aissd_selector_quality_k_layout_quantization(
+    candidate: dict[str, Any],
+) -> dict[str, Any] | None:
+    selector_path = str(candidate.get("selector_path") or "")
+    if selector_path and "..aissd_qkpack." in selector_path and os.path.isfile(
+        selector_path
+    ):
+        header = _aissd_selector_quality_read_qkpack_header(selector_path)
+        if header.get("magic") == "AISSDQKPACK":
+            return {
+                "source": "selector_sidecar_header",
+                "source_path": selector_path,
+                "bucket": int(header.get("bucket", 0) or 0),
+                "scale": float(header["scale"]),
+                "zero_point": int(header.get("zero_point", 0)),
+                "row_stride_bytes": int(header["row_stride_bytes"]),
+                "chunk_bytes": int(header["packed_bytes"]),
+                "packed_offset": int(header.get("packed_offset", 4096)),
+                "packed_dtype": str(header.get("packed_dtype", "int16")),
+                "layout": str(header.get("layout", "token_major_hkv_dim")),
+            }
+
+    abi_path = str(
+        os.environ.get(
+            "AISSD_SELECTOR_QUALITY_K_LAYOUT_ABI_PATH",
+            os.environ.get("AISSD_QKPACK_ABI", ""),
+        )
+    ).strip()
+    if not abi_path:
+        return None
+    with open(abi_path, "r", encoding="utf-8") as f:
+        abi = json.load(f)
+    bucket = _aissd_env_int(
+        "AISSD_SELECTOR_QUALITY_K_LAYOUT_TRACE_BUCKET",
+        int(candidate.get("qkpack_bucket", 0) or abi.get("reference_bucket", 128)),
+    )
+    bucket_info = (abi.get("buckets") or {}).get(str(bucket), {})
+    packed_abi = (
+        bucket_info.get("packed_k_chunk_abi", {})
+        if isinstance(bucket_info, dict)
+        else {}
+    )
+    return {
+        "source": "abi_json",
+        "source_path": abi_path,
+        "bucket": int(bucket),
+        "scale": float(packed_abi.get("scale", abi["scale"])),
+        "zero_point": int(packed_abi.get("zero_point", abi.get("zero_point", 0))),
+        "row_stride_bytes": int(
+            packed_abi.get("row_stride_bytes", abi["row_stride_bytes"])
+        ),
+        "chunk_bytes": int(packed_abi.get("chunk_bytes", abi["chunk_bytes"])),
+        "packed_offset": 0,
+        "packed_dtype": str(
+            packed_abi.get("packed_dtype", abi.get("packed_dtype", "int16"))
+        ),
+        "layout": str(
+            packed_abi.get("layout", abi.get("layout", "token_major_hkv_dim"))
+        ),
+    }
+
+
+def _aissd_selector_quality_pack_k_int16(
+    k_raw: torch.Tensor,
+    *,
+    scale: float,
+    zero_point: int,
+    row_stride_bytes: int,
+) -> tuple[torch.Tensor, bytes, int, int]:
+    if not (float(scale) > 0.0):
+        raise RuntimeError(f"K-layout trace requires positive scale, got {scale}")
+    rows = int(k_raw.shape[0])
+    row_values = int(k_raw.shape[1]) * int(k_raw.shape[2])
+    row_data_bytes = row_values * 2
+    if int(row_stride_bytes) < row_data_bytes:
+        raise RuntimeError(
+            f"K-layout row_stride_bytes={row_stride_bytes} < data={row_data_bytes}"
+        )
+    rounded = torch.round(
+        k_raw.to(dtype=torch.float64) / float(scale) + int(zero_point)
+    )
+    clamped_low = int((rounded < -32768.0).sum().item())
+    clamped_high = int((rounded > 32767.0).sum().item())
+    packed = rounded.clamp(-32768.0, 32767.0).to(torch.int16).contiguous()
+    payload = bytearray(rows * int(row_stride_bytes))
+    packed_rows = packed.reshape(rows, row_values)
+    for row in range(rows):
+        row_bytes = packed_rows[row].contiguous().view(torch.uint8).numpy().tobytes()
+        start = row * int(row_stride_bytes)
+        payload[start : start + row_data_bytes] = row_bytes
+    return packed, bytes(payload), clamped_low, clamped_high
+
+
+def _aissd_selector_quality_build_k_layout_trace(
+    *,
+    req_id: str,
+    request_ordinal: int,
+    decode_step: int,
+    layer_id: int,
+    candidates: list[dict[str, Any]],
+    num_heads: int,
+    num_kv_heads: int,
+    head_size: int,
+) -> dict[str, Any]:
+    candidate_id = _aissd_env_int(
+        "AISSD_SELECTOR_QUALITY_K_LAYOUT_TRACE_CANDIDATE", 0
+    )
+    if not (0 <= int(candidate_id) < len(candidates)):
+        raise RuntimeError(
+            "K-layout trace candidate out of range: "
+            f"candidate={candidate_id} candidate_count={len(candidates)}"
+        )
+    candidate = candidates[int(candidate_id)]
+    source_path = str(candidate.get("source_path") or "")
+    if not source_path:
+        raise RuntimeError("K-layout trace candidate has no source_path")
+
+    layout_info: dict[str, Any] = {}
+    k_raw, source_dtype, source_format = _aissd_selector_quality_read_source_k(
+        source_path,
+        int(layer_id),
+        int(num_kv_heads),
+        int(head_size),
+        layout_info=layout_info,
+    )
+    tokens = int(k_raw.shape[0])
+    coords = _aissd_selector_quality_k_layout_coords(
+        tokens, int(num_kv_heads), int(head_size)
+    )
+    raw_storage = k_raw.contiguous().view(torch.uint8).numpy().tobytes()
+    quant = _aissd_selector_quality_k_layout_quantization(candidate)
+
+    expected_i16: torch.Tensor | None = None
+    expected_payload: bytes | None = None
+    actual_payload: bytes | None = None
+    clamped_low = 0
+    clamped_high = 0
+    if quant is not None:
+        if str(quant["packed_dtype"]).lower() not in ("int16", "s16"):
+            raise RuntimeError(
+                f"K-layout trace requires int16 packed dtype, got {quant['packed_dtype']!r}"
+            )
+        if str(quant["layout"]) != "token_major_hkv_dim":
+            raise RuntimeError(
+                f"K-layout trace requires token_major_hkv_dim, got {quant['layout']!r}"
+            )
+        expected_i16, expected_payload, clamped_low, clamped_high = (
+            _aissd_selector_quality_pack_k_int16(
+                k_raw,
+                scale=float(quant["scale"]),
+                zero_point=int(quant["zero_point"]),
+                row_stride_bytes=int(quant["row_stride_bytes"]),
+            )
+        )
+        if len(expected_payload) != int(quant["chunk_bytes"]):
+            raise RuntimeError(
+                "K-layout expected packed payload size mismatch: "
+                f"got={len(expected_payload)} expected={quant['chunk_bytes']}"
+            )
+        if quant["source"] == "selector_sidecar_header":
+            fd = os.open(str(quant["source_path"]), os.O_RDONLY)
+            try:
+                actual_payload = _aissd_selector_quality_read_exact(
+                    fd,
+                    int(quant["chunk_bytes"]),
+                    int(quant["packed_offset"]),
+                )
+            finally:
+                os.close(fd)
+
+    source_shape = [int(x) for x in layout_info["source_tensor_shape"]]
+    elem_bytes = int(layout_info["source_element_bytes"])
+    coordinate_records: list[dict[str, Any]] = []
+    source_fd = os.open(source_path, os.O_RDONLY)
+    try:
+        for token, kv_head, dim in coords:
+            flat_index = (
+                (int(token) * int(num_kv_heads) + int(kv_head))
+                * int(head_size)
+                + int(dim)
+            )
+            tensor_byte_offset = int(flat_index) * elem_bytes
+            tensor_bytes = raw_storage[
+                tensor_byte_offset : tensor_byte_offset + elem_bytes
+            ]
+            source_file_offset = _aissd_selector_quality_source_k_file_offset(
+                source_format=str(source_format),
+                source_shape=source_shape,
+                metadata_bytes=int(layout_info["metadata_bytes"]),
+                element_bytes=elem_bytes,
+                layer_id=int(layer_id),
+                token=int(token),
+                kv_head=int(kv_head),
+                dim=int(dim),
+                num_kv_heads=int(num_kv_heads),
+                head_size=int(head_size),
+            )
+            source_bytes = _aissd_selector_quality_read_exact(
+                source_fd, elem_bytes, source_file_offset
+            )
+            packed_byte_offset = None
+            expected_packed = None
+            actual_packed = None
+            if quant is not None and expected_i16 is not None:
+                packed_byte_offset = (
+                    int(token) * int(quant["row_stride_bytes"])
+                    + (int(kv_head) * int(head_size) + int(dim)) * 2
+                )
+                expected_packed = int(expected_i16[token, kv_head, dim].item())
+                if actual_payload is not None:
+                    actual_packed = int(
+                        struct.unpack(
+                            "<h",
+                            actual_payload[
+                                packed_byte_offset : packed_byte_offset + 2
+                            ],
+                        )[0]
+                    )
+            q_per_kv = int(num_heads) // int(num_kv_heads)
+            coordinate_records.append(
+                {
+                    "token": int(token),
+                    "kv_head": int(kv_head),
+                    "dim": int(dim),
+                    "hkv_dim_index": int(kv_head) * int(head_size) + int(dim),
+                    "cpu_flat_index": int(flat_index),
+                    "cpu_tensor_byte_offset": int(tensor_byte_offset),
+                    "source_file_byte_offset": int(source_file_offset),
+                    "source_storage_hex_le": source_bytes.hex(),
+                    "cpu_tensor_storage_hex_le": tensor_bytes.hex(),
+                    "source_bytes_match_cpu_tensor": bool(source_bytes == tensor_bytes),
+                    "source_value": float(k_raw[token, kv_head, dim].item()),
+                    "gqa_query_heads": list(
+                        range(
+                            int(kv_head) * q_per_kv,
+                            (int(kv_head) + 1) * q_per_kv,
+                        )
+                    ),
+                    "packed_payload_byte_offset": packed_byte_offset,
+                    "expected_packed_int16": expected_packed,
+                    "actual_sidecar_int16": actual_packed,
+                    "sidecar_coordinate_match": (
+                        None
+                        if actual_packed is None
+                        else bool(actual_packed == expected_packed)
+                    ),
+                }
+            )
+    finally:
+        os.close(source_fd)
+
+    expected_sha = (
+        hashlib.sha256(expected_payload).hexdigest()
+        if expected_payload is not None
+        else None
+    )
+    actual_sha = (
+        hashlib.sha256(actual_payload).hexdigest()
+        if actual_payload is not None
+        else None
+    )
+    return {
+        "schema_version": 1,
+        "record_type": "aissd_selector_k_layout_trace",
+        "req_id": str(req_id),
+        "request_ordinal": int(request_ordinal),
+        "decode_step": int(decode_step),
+        "layer_id": int(layer_id),
+        "candidate_id": int(candidate_id),
+        "source_chunk_index": int(
+            candidate.get("source_chunk_index", candidate_id)
+        ),
+        "token_start": int(candidate.get("token_start", 0)),
+        "token_end": int(candidate.get("token_end", tokens)),
+        "source_path": source_path,
+        "selector_path": str(candidate.get("selector_path") or ""),
+        "qkpack_mode": str(candidate.get("qkpack_mode") or ""),
+        "source_format": str(source_format),
+        "source_dtype": str(source_dtype),
+        "source_tensor_shape": source_shape,
+        "cpu_k_shape": [int(x) for x in k_raw.shape],
+        "cpu_k_stride_elements": [int(x) for x in k_raw.stride()],
+        "cpu_k_contiguous": bool(k_raw.is_contiguous()),
+        "semantic_layout": "token_major_[token,kv_head,head_dim]",
+        "cpu_flat_index_formula": "((token*num_kv_heads)+kv_head)*head_size+dim",
+        "gqa_mapping_formula": "q_head=kv_head*(num_q_heads/num_kv_heads)+group",
+        "num_q_heads": int(num_heads),
+        "num_kv_heads": int(num_kv_heads),
+        "head_size": int(head_size),
+        "cpu_k_storage_sha256": hashlib.sha256(raw_storage).hexdigest(),
+        "quantization": quant,
+        "expected_packed_sha256": expected_sha,
+        "actual_sidecar_payload_sha256": actual_sha,
+        "full_sidecar_payload_match": (
+            None
+            if actual_payload is None or expected_payload is None
+            else bool(actual_payload == expected_payload)
+        ),
+        "quantized_clamped_low_count": int(clamped_low),
+        "quantized_clamped_high_count": int(clamped_high),
+        "all_source_coordinates_match_cpu_tensor": all(
+            bool(item["source_bytes_match_cpu_tensor"])
+            for item in coordinate_records
+        ),
+        "all_sidecar_coordinates_match": (
+            None
+            if actual_payload is None
+            else all(
+                bool(item["sidecar_coordinate_match"])
+                for item in coordinate_records
+            )
+        ),
+        "coordinates": coordinate_records,
+    }
 
 
 def _aissd_qk_calib_dump_enabled() -> bool:
@@ -1572,6 +2027,22 @@ def _aissd_maybe_trace_selector_quality(
         )
         cached_tokens = int(cached_tokens_cpu[r].item())
         t0 = time.perf_counter()
+        k_layout_trace = None
+        if _aissd_selector_quality_k_layout_trace_matches(
+            request_ordinal=int(req_ordinal),
+            decode_step=int(decode_step),
+            layer_id=int(layer_id),
+        ):
+            k_layout_trace = _aissd_selector_quality_build_k_layout_trace(
+                req_id=req_id,
+                request_ordinal=int(req_ordinal),
+                decode_step=int(decode_step),
+                layer_id=int(layer_id),
+                candidates=candidates,
+                num_heads=int(num_heads),
+                num_kv_heads=int(num_kv_heads),
+                head_size=int(head_size),
+            )
         requested_mode = _aissd_selector_quality_reference_mode()
         modes = (
             ("production", "fp32")
@@ -1655,6 +2126,8 @@ def _aissd_maybe_trace_selector_quality(
             "lmcache_cached_tokens": int(cached_tokens),
             "trace_elapsed_ms": float(elapsed_ms),
         }
+        if isinstance(k_layout_trace, dict):
+            record["k_layout_trace"] = k_layout_trace
         if isinstance(same_algorithm_primary, dict):
             record.update(
                 {
