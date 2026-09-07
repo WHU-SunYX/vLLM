@@ -1135,6 +1135,84 @@ def _aissd_selector_quality_write_trace_bytes(path: str, data: bytes) -> None:
     os.replace(tmp, path)
 
 
+def _aissd_selector_quality_resolve_tensor_ddr_format(
+    *,
+    abi_path: str,
+    bucket_info: dict[str, Any],
+    tensor_info: dict[str, Any],
+    tensor_name: str,
+    context: str,
+) -> tuple[str, str]:
+    """Resolve tensor_ddr_format, including ABI files made by older generators.
+
+    Older aissd_qkpack ABI files copied tensor_ddr_format for k_flat but omitted
+    it for q_block.  The source input.json path is already recorded per bucket,
+    so use that authoritative compiler metadata before considering an explicit
+    diagnostic override.  Never silently infer an ambiguous physical layout
+    from memory size/stride alone.
+    """
+    value = str(tensor_info.get("tensor_ddr_format") or "").strip()
+    if value:
+        return value, "abi_json"
+
+    input_json_raw = str(bucket_info.get("input_json") or "").strip()
+    input_json_path = ""
+    input_json_issue = "input_json is not recorded in ABI"
+    if input_json_raw:
+        input_json_path = os.path.expanduser(input_json_raw)
+        if not os.path.isabs(input_json_path):
+            input_json_path = os.path.join(
+                os.path.dirname(os.path.abspath(abi_path)), input_json_path
+            )
+        input_json_path = os.path.abspath(input_json_path)
+        if os.path.isfile(input_json_path):
+            try:
+                with open(input_json_path, "r", encoding="utf-8") as f:
+                    compiler_input = json.load(f)
+                if not isinstance(compiler_input, dict):
+                    raise TypeError(
+                        f"compiler input root is {type(compiler_input).__name__}, "
+                        "expected object"
+                    )
+                for candidate in compiler_input.values():
+                    if (
+                        isinstance(candidate, dict)
+                        and str(candidate.get("tensor_name") or "")
+                        == str(tensor_name)
+                    ):
+                        value = str(
+                            candidate.get("tensor_ddr_format") or ""
+                        ).strip()
+                        if value:
+                            return value, f"input_json:{input_json_path}"
+                        input_json_issue = (
+                            f"{input_json_path} tensor {tensor_name!r} has no "
+                            "tensor_ddr_format"
+                        )
+                        break
+                else:
+                    input_json_issue = (
+                        f"{input_json_path} has no tensor {tensor_name!r}"
+                    )
+            except (OSError, ValueError, TypeError) as exc:
+                input_json_issue = f"cannot read {input_json_path}: {exc}"
+        else:
+            input_json_issue = f"input_json does not exist: {input_json_path}"
+
+    override = str(
+        os.environ.get("AISSD_SELECTOR_QUALITY_Q_DDR_FORMAT", "")
+    ).strip()
+    if override:
+        return override, "env:AISSD_SELECTOR_QUALITY_Q_DDR_FORMAT"
+
+    raise RuntimeError(
+        f"{context} cannot determine {tensor_name}.tensor_ddr_format: ABI "
+        f"{abi_path} omits it and {input_json_issue}. Regenerate the ABI with "
+        "the corrected gen_qkpack_abi.py, or set the diagnostic-only "
+        "AISSD_SELECTOR_QUALITY_Q_DDR_FORMAT explicitly."
+    )
+
+
 def _aissd_selector_quality_q_layout_abi(
     candidates: list[dict[str, Any]],
 ) -> dict[str, Any]:
@@ -1189,6 +1267,15 @@ def _aissd_selector_quality_q_layout_abi(
         raise RuntimeError(
             f"Q-layout trace ABI bucket c{bucket} has no q_block metadata"
         )
+    q_ddr_format, q_ddr_format_source = (
+        _aissd_selector_quality_resolve_tensor_ddr_format(
+            abi_path=abi_path,
+            bucket_info=bucket_info,
+            tensor_info=qinfo,
+            tensor_name=str(qinfo.get("tensor_name", "q_block")),
+            context="Q-layout trace",
+        )
+    )
 
     return {
         "source": "abi_json",
@@ -1199,6 +1286,8 @@ def _aissd_selector_quality_q_layout_abi(
         "tensor_bank_offset": int(qinfo.get("tensor_bank_offset", 0)),
         "tensor_precision": int(qinfo.get("tensor_precision", 0)),
         "tensor_type": str(qinfo.get("tensor_type", "")),
+        "tensor_ddr_format": q_ddr_format,
+        "tensor_ddr_format_source": q_ddr_format_source,
         "tensor_width": int(qinfo.get("tensor_width", 0)),
         "tensor_ori_channels": int(qinfo.get("tensor_ori_channels", 0)),
         "tensor_memory_size": int(qinfo.get("tensor_memory_size", 0)),
@@ -1206,6 +1295,85 @@ def _aissd_selector_quality_q_layout_abi(
         "scale": float(qinfo.get("tensor_scale_factor", 0.0)),
         "zero_point": int(qinfo.get("tensor_zero_point", 0)),
     }
+
+
+def _aissd_selector_quality_q_physical_layout(
+    *,
+    ddr_format: str,
+    q_rows: int,
+    q_cols: int,
+    element_bytes: int,
+    row_stride_bytes: int,
+    memory_size: int,
+) -> dict[str, Any]:
+    """Resolve the compiler's physical q_block layout from ABI metadata.
+
+    blocking-NHWC is channel-blocked.  With the current ABI the derived block
+    is 2048 / (32 heads * 2 bytes) = 32 channels, and the physical index is:
+
+      ((logical_row // 32) * num_q_heads + q_head) * 32
+        + logical_row % 32
+
+    It is not a whole-column/q-head-major [32, 1024] matrix.
+    """
+    rows = int(q_rows)
+    cols = int(q_cols)
+    elem = int(element_bytes)
+    stride = int(row_stride_bytes)
+    size = int(memory_size)
+    denom = cols * elem
+    if (
+        str(ddr_format).strip().lower().replace("_", "-")
+        == "blocking-nhwc"
+        and rows > 0
+        and denom > 0
+        and stride > 0
+        and stride % denom == 0
+    ):
+        channel_block = stride // denom
+        required = ((rows + channel_block - 1) // channel_block) * stride
+        if channel_block > 0 and size >= required:
+            return {
+                "name": f"blocking_nhwc_c{channel_block}",
+                "blocking_nhwc": True,
+                "q_head_major": False,
+                "channel_block": int(channel_block),
+                "required_bytes": int(required),
+            }
+
+    q_head_major = stride >= rows * elem and size >= cols * stride
+    required = cols * stride if q_head_major else rows * cols * elem
+    return {
+        "name": "q_head_major_rows" if q_head_major else "logical_row_major",
+        "blocking_nhwc": False,
+        "q_head_major": bool(q_head_major),
+        "channel_block": 0,
+        "required_bytes": int(required),
+    }
+
+
+def _aissd_selector_quality_q_physical_byte_offset(
+    *,
+    logical_row: int,
+    q_head: int,
+    q_cols: int,
+    element_bytes: int,
+    row_stride_bytes: int,
+    layout: dict[str, Any],
+) -> int:
+    row = int(logical_row)
+    head = int(q_head)
+    elem = int(element_bytes)
+    if bool(layout["blocking_nhwc"]):
+        block = int(layout["channel_block"])
+        return int(
+            (row // block) * int(row_stride_bytes)
+            + head * block * elem
+            + (row % block) * elem
+        )
+    if bool(layout["q_head_major"]):
+        return int(head * int(row_stride_bytes) + row * elem)
+    return int((row * int(q_cols) + head) * elem)
 
 
 def _aissd_selector_quality_build_q_layout_trace(
@@ -1260,16 +1428,16 @@ def _aissd_selector_quality_build_q_layout_trace(
         raise RuntimeError(
             f"Q-layout trace invalid physical q_block bytes={physical_bytes}"
         )
-    column_major = (
-        row_stride_bytes >= q_rows * 2
-        and physical_bytes >= q_cols * row_stride_bytes
+    q_layout = _aissd_selector_quality_q_physical_layout(
+        ddr_format=str(quant["tensor_ddr_format"]),
+        q_rows=q_rows,
+        q_cols=q_cols,
+        element_bytes=2,
+        row_stride_bytes=row_stride_bytes,
+        memory_size=physical_bytes,
     )
-    if column_major:
-        physical_layout = "q_head_major_rows"
-        physical_required = q_cols * row_stride_bytes
-    else:
-        physical_layout = "logical_row_major"
-        physical_required = q_rows * q_cols * 2
+    physical_layout = str(q_layout["name"])
+    physical_required = int(q_layout["required_bytes"])
     if physical_bytes < physical_required:
         raise RuntimeError(
             "Q-layout trace physical q_block is too small: "
@@ -1303,10 +1471,14 @@ def _aissd_selector_quality_build_q_layout_trace(
         kv_head = q_head // q_per_kv
         for d in range(dim):
             logical_row = kv_head * dim + d
-            if column_major:
-                byte_offset = q_head * row_stride_bytes + logical_row * 2
-            else:
-                byte_offset = (logical_row * q_cols + q_head) * 2
+            byte_offset = _aissd_selector_quality_q_physical_byte_offset(
+                logical_row=logical_row,
+                q_head=q_head,
+                q_cols=q_cols,
+                element_bytes=2,
+                row_stride_bytes=row_stride_bytes,
+                layout=q_layout,
+            )
             if byte_offset < 0 or byte_offset + 2 > physical_bytes:
                 raise RuntimeError(
                     "Q-layout trace active coordinate exceeds q_block: "
@@ -1335,10 +1507,14 @@ def _aissd_selector_quality_build_q_layout_trace(
         logical_col = q_head
         source_flat_index = q_head * dim + d
         source_byte_offset = source_flat_index * source_elem_bytes
-        if column_major:
-            physical_byte_offset = q_head * row_stride_bytes + logical_row * 2
-        else:
-            physical_byte_offset = (logical_row * q_cols + q_head) * 2
+        physical_byte_offset = _aissd_selector_quality_q_physical_byte_offset(
+            logical_row=logical_row,
+            q_head=q_head,
+            q_cols=q_cols,
+            element_bytes=2,
+            row_stride_bytes=row_stride_bytes,
+            layout=q_layout,
+        )
         expected_i16 = int(
             struct.unpack_from("<h", expected_payload, physical_byte_offset)[0]
         )
@@ -1417,10 +1593,16 @@ def _aissd_selector_quality_build_q_layout_trace(
         ),
         "physical_layout": physical_layout,
         "physical_offset_formula": (
-            "q_head*row_stride_bytes+logical_row*2"
-            if column_major
-            else "(logical_row*num_q_heads+q_head)*2"
+            "(logical_row//channel_block)*row_stride_bytes+"
+            "q_head*channel_block*2+(logical_row%channel_block)*2"
+            if bool(q_layout["blocking_nhwc"])
+            else (
+                "q_head*row_stride_bytes+logical_row*2"
+                if bool(q_layout["q_head_major"])
+                else "(logical_row*num_q_heads+q_head)*2"
+            )
         ),
+        "physical_channel_block": int(q_layout["channel_block"]),
         "physical_bytes": int(physical_bytes),
         "row_stride_bytes": int(row_stride_bytes),
         "active_value_count": len(active_indices),
@@ -1982,6 +2164,7 @@ def _aissd_selector_quality_same_algorithm(
     score_mode_code: int,
     chunk_size: int,
     num_heads: int,
+    store_all_scores: bool | None = None,
 ) -> dict[str, Any]:
     """Run the SSD plugin aggregation exactly on raw-Q/raw-K CPU scores.
 
@@ -2156,8 +2339,562 @@ def _aissd_selector_quality_same_algorithm(
         "cpu_chunk_score_max": float(max(cpu_scores)),
         "cpu_chunk_score_mean": float(sum(cpu_scores) / len(cpu_scores)),
     }
-    if _env_flag("AISSD_SELECTOR_QUALITY_SAME_ALGO_STORE_ALL_SCORES", "0"):
+    if store_all_scores is None:
+        store_all_scores = _env_flag(
+            "AISSD_SELECTOR_QUALITY_SAME_ALGO_STORE_ALL_SCORES", "0"
+        )
+    if store_all_scores:
         result["cpu_chunk_scores"] = cpu_scores
+    return result
+
+
+def _aissd_selector_quality_int16_abi_enabled() -> bool:
+    """Enable the diagnostic-only INT16 ABI CPU reference."""
+    return _env_flag("AISSD_SELECTOR_QUALITY_INT16_ABI_REFERENCE", "0")
+
+
+def _aissd_selector_quality_int16_abi_matches(
+    *, request_ordinal: int, decode_step: int, layer_id: int
+) -> bool:
+    if not _aissd_selector_quality_int16_abi_enabled():
+        return False
+    return (
+        int(request_ordinal)
+        == _aissd_env_int("AISSD_SELECTOR_QUALITY_INT16_ABI_REQUEST", 0)
+        and int(decode_step)
+        == _aissd_env_int("AISSD_SELECTOR_QUALITY_INT16_ABI_DECODE_STEP", 0)
+        and int(layer_id)
+        == _aissd_env_int("AISSD_SELECTOR_QUALITY_INT16_ABI_LAYER", 0)
+    )
+
+
+def _aissd_selector_quality_int16_abi_metadata(
+    candidates: list[dict[str, Any]],
+) -> dict[str, Any]:
+    abi_path = str(
+        os.environ.get("AISSD_SELECTOR_QUALITY_INT16_ABI_PATH", "")
+    ).strip()
+    if not abi_path:
+        # Reuse the already established Q-layout/sidecar ABI discovery only as
+        # a convenience.  The dedicated variable above always wins.
+        candidate = candidates[0] if candidates else {}
+        selector_path = str(candidate.get("selector_path") or "")
+        if selector_path and "..aissd_qkpack." in selector_path:
+            header = _aissd_selector_quality_read_qkpack_header(selector_path)
+            abi_path = str(header.get("abi_path") or "").strip()
+    if not abi_path:
+        abi_path = str(os.environ.get("AISSD_QKPACK_ABI", "")).strip()
+    if not abi_path:
+        raise RuntimeError(
+            "INT16 ABI reference cannot resolve ABI JSON; set "
+            "AISSD_SELECTOR_QUALITY_INT16_ABI_PATH"
+        )
+    if not os.path.isfile(abi_path):
+        raise RuntimeError(f"INT16 ABI JSON does not exist: {abi_path}")
+
+    with open(abi_path, "r", encoding="utf-8") as f:
+        abi = json.load(f)
+    if not isinstance(abi, dict):
+        raise RuntimeError(f"INT16 ABI root is not an object: {abi_path}")
+
+    default_bucket = int(abi.get("reference_bucket", 128))
+    bucket = _aissd_env_int(
+        "AISSD_SELECTOR_QUALITY_INT16_ABI_BUCKET", default_bucket
+    )
+    bucket_info = (abi.get("buckets") or {}).get(str(bucket))
+    if not isinstance(bucket_info, dict):
+        raise RuntimeError(f"INT16 ABI has no bucket c{bucket}: {abi_path}")
+    kinfo = bucket_info.get("k_flat")
+    qinfo = bucket_info.get("q_block")
+    output = bucket_info.get("output")
+    packed_k = bucket_info.get("packed_k_chunk_abi")
+    if not all(isinstance(x, dict) for x in (kinfo, qinfo, output, packed_k)):
+        raise RuntimeError(
+            f"INT16 ABI bucket c{bucket} lacks k_flat/q_block/output metadata"
+        )
+    if int(kinfo.get("tensor_precision", 0)) != 16 or int(
+        qinfo.get("tensor_precision", 0)
+    ) != 16:
+        raise RuntimeError("INT16 ABI reference requires INT16 K and Q inputs")
+    if str(output.get("tensor_type", "")).lower() != "float" or int(
+        output.get("tensor_precision", 0)
+    ) != 32:
+        raise RuntimeError(
+            "INT16 ABI reference currently requires FP32 qk_scores_packed output"
+        )
+    q_ddr_format, q_ddr_format_source = (
+        _aissd_selector_quality_resolve_tensor_ddr_format(
+            abi_path=abi_path,
+            bucket_info=bucket_info,
+            tensor_info=qinfo,
+            tensor_name=str(qinfo.get("tensor_name", "q_block")),
+            context="INT16 ABI reference",
+        )
+    )
+
+    return {
+        "abi_path": os.path.abspath(abi_path),
+        "bucket": int(bucket),
+        "chunk_size": int(abi["chunk_size"]),
+        "num_kv_heads": int(abi["num_kv_heads"]),
+        "head_dim": int(abi["head_dim"]),
+        "k": {
+            "scale": float(kinfo["tensor_scale_factor"]),
+            "zero_point": int(kinfo.get("tensor_zero_point", 0)),
+            "memory_size": int(kinfo["tensor_memory_size"]),
+            "row_stride_bytes": int(kinfo["tensor_row_ddr_step"]),
+            "width": int(kinfo["tensor_width"]),
+            "ori_channels": int(kinfo["tensor_ori_channels"]),
+            "chunk_bytes": int(packed_k["chunk_bytes"]),
+            "layout": str(packed_k.get("layout", "token_major_hkv_dim")),
+        },
+        "q": {
+            "scale": float(qinfo["tensor_scale_factor"]),
+            "zero_point": int(qinfo.get("tensor_zero_point", 0)),
+            "memory_size": int(qinfo["tensor_memory_size"]),
+            "row_stride_bytes": int(qinfo["tensor_row_ddr_step"]),
+            "width": int(qinfo["tensor_width"]),
+            "ori_channels": int(qinfo["tensor_ori_channels"]),
+            "ddr_format": q_ddr_format,
+            "ddr_format_source": q_ddr_format_source,
+        },
+        "output": {
+            "memory_size": int(output["tensor_memory_size"]),
+            "height": int(output.get("tensor_height", 0)),
+            "width": int(output.get("tensor_width", 0)),
+            "dtype": "float32",
+        },
+    }
+
+
+def _aissd_selector_quality_tensor_bytes(tensor: torch.Tensor) -> bytes:
+    return tensor.detach().contiguous().view(torch.uint8).numpy().tobytes()
+
+
+def _aissd_selector_quality_error_metrics(
+    reference: torch.Tensor,
+    actual: torch.Tensor,
+    *,
+    mask: torch.Tensor | None = None,
+) -> dict[str, Any]:
+    ref = reference.detach().to(device="cpu", dtype=torch.float64)
+    got = actual.detach().to(device="cpu", dtype=torch.float64)
+    if tuple(ref.shape) != tuple(got.shape):
+        raise RuntimeError(
+            f"comparison shape mismatch reference={tuple(ref.shape)} "
+            f"actual={tuple(got.shape)}"
+        )
+    if mask is not None:
+        use = mask.detach().to(device="cpu", dtype=torch.bool)
+        if tuple(use.shape) != tuple(ref.shape):
+            raise RuntimeError(
+                f"comparison mask mismatch mask={tuple(use.shape)} "
+                f"tensor={tuple(ref.shape)}"
+            )
+        ref = ref[use]
+        got = got[use]
+    else:
+        ref = ref.reshape(-1)
+        got = got.reshape(-1)
+    if ref.numel() == 0:
+        raise RuntimeError("comparison contains zero values")
+    if not bool(torch.isfinite(ref).all().item()) or not bool(
+        torch.isfinite(got).all().item()
+    ):
+        raise RuntimeError("comparison contains non-finite values")
+
+    diff = got - ref
+    abs_diff = diff.abs()
+    ref_norm = float(torch.linalg.vector_norm(ref).item())
+    got_norm = float(torch.linalg.vector_norm(got).item())
+    denom = ref.abs().clamp_min(1.0e-12)
+    cosine = float(
+        torch.dot(ref, got).item() / max(ref_norm * got_norm, 1.0e-30)
+    )
+    return {
+        "count": int(ref.numel()),
+        "exact_equal_count": int((ref == got).sum().item()),
+        "max_abs_error": float(abs_diff.max().item()),
+        "mean_abs_error": float(abs_diff.mean().item()),
+        "rmse": float(torch.sqrt(torch.mean(diff * diff)).item()),
+        "max_relative_error": float((abs_diff / denom).max().item()),
+        "relative_l2_error": float(
+            torch.linalg.vector_norm(diff).item() / max(ref_norm, 1.0e-30)
+        ),
+        "cosine_similarity": cosine,
+        "reference_min": float(ref.min().item()),
+        "reference_max": float(ref.max().item()),
+        "actual_min": float(got.min().item()),
+        "actual_max": float(got.max().item()),
+    }
+
+
+def _aissd_selector_quality_topn_pair(
+    reference_ids: list[int], actual_ids: list[int]
+) -> dict[str, Any]:
+    ref = [int(x) for x in reference_ids]
+    got = [int(x) for x in actual_ids]
+    overlap = set(ref).intersection(got)
+    prefix = 0
+    for a, b in zip(ref, got):
+        if a != b:
+            break
+        prefix += 1
+    return {
+        "reference_topn_ids": ref,
+        "actual_topn_ids": got,
+        "overlap_count": int(len(overlap)),
+        "recall": float(len(overlap)) / float(max(1, len(ref))),
+        "exact_set_match": bool(len(ref) == len(got) and set(ref) == set(got)),
+        "exact_order_match": bool(ref == got),
+        "prefix_match_count": int(prefix),
+    }
+
+
+def _aissd_selector_quality_build_int16_abi_reference(
+    *,
+    req_id: str,
+    request_ordinal: int,
+    decode_step: int,
+    layer_id: int,
+    q_row: torch.Tensor,
+    candidates: list[dict[str, Any]],
+    score_chunks: list[torch.Tensor],
+    ssd_selected: list[int],
+    num_heads: int,
+    num_kv_heads: int,
+    head_size: int,
+    attention_scale: float,
+    top_n: int,
+    top_m: int,
+    score_mode_code: int,
+    chunk_size: int,
+) -> dict[str, Any]:
+    """Build the exact external INT16 ABI inputs and a CPU QK reference.
+
+    This is a shadow diagnostic.  It does not replace Q/K sent to the SSD and
+    does not change the production selector result.
+    """
+    meta = _aissd_selector_quality_int16_abi_metadata(candidates)
+    bucket = int(meta["bucket"])
+    hq = int(num_heads)
+    hkv = int(num_kv_heads)
+    dim = int(head_size)
+    chunk = int(chunk_size)
+    candidate_count = len(candidates)
+    if bucket < candidate_count:
+        raise RuntimeError(
+            f"INT16 ABI bucket c{bucket} < candidate_count={candidate_count}"
+        )
+    if (chunk, hkv, dim) != (
+        int(meta["chunk_size"]),
+        int(meta["num_kv_heads"]),
+        int(meta["head_dim"]),
+    ):
+        raise RuntimeError(
+            "INT16 ABI model shape mismatch: "
+            f"runtime={(chunk, hkv, dim)} abi="
+            f"{(meta['chunk_size'], meta['num_kv_heads'], meta['head_dim'])}"
+        )
+    if hq <= 0 or hq % hkv:
+        raise RuntimeError(f"INT16 ABI invalid GQA Hq={hq} Hkv={hkv}")
+    if int(meta["q"]["width"]) != hq or int(meta["q"]["ori_channels"]) != hkv * dim:
+        raise RuntimeError("INT16 ABI q_block shape does not match runtime Q")
+    if int(meta["k"]["width"]) != hkv * dim:
+        raise RuntimeError("INT16 ABI k_flat width does not match runtime K")
+    if str(meta["k"]["layout"]) != "token_major_hkv_dim":
+        raise RuntimeError(
+            f"INT16 ABI unsupported K layout={meta['k']['layout']!r}"
+        )
+
+    q_scale = float(meta["q"]["scale"])
+    k_scale = float(meta["k"]["scale"])
+    q_zp = int(meta["q"]["zero_point"])
+    k_zp = int(meta["k"]["zero_point"])
+    if q_scale <= 0.0 or k_scale <= 0.0:
+        raise RuntimeError(f"INT16 ABI invalid scales q={q_scale} k={k_scale}")
+    if not (-32768 <= q_zp <= 32767 and -32768 <= k_zp <= 32767):
+        raise RuntimeError(f"INT16 ABI zero point out of range q={q_zp} k={k_zp}")
+
+    q_cpu = q_row.detach().to(device="cpu").reshape(hq, dim).contiguous()
+    q_rounded = torch.round(q_cpu.to(torch.float64) / q_scale) + q_zp
+    q_clamped_low = int((q_rounded < -32768.0).sum().item())
+    q_clamped_high = int((q_rounded > 32767.0).sum().item())
+    q_active = q_rounded.clamp(-32768.0, 32767.0).to(torch.int16)
+
+    q_memory_size = int(meta["q"]["memory_size"])
+    q_row_stride = int(meta["q"]["row_stride_bytes"])
+    q_rows = hkv * dim
+    q_layout = _aissd_selector_quality_q_physical_layout(
+        ddr_format=str(meta["q"]["ddr_format"]),
+        q_rows=q_rows,
+        q_cols=hq,
+        element_bytes=2,
+        row_stride_bytes=q_row_stride,
+        memory_size=q_memory_size,
+    )
+    if q_memory_size < int(q_layout["required_bytes"]):
+        raise RuntimeError(
+            "INT16 ABI q_block physical memory is too small: "
+            f"bytes={q_memory_size} required={q_layout['required_bytes']} "
+            f"layout={q_layout['name']}"
+        )
+    q_payload = bytearray(struct.pack("<h", q_zp) * (q_memory_size // 2))
+    q_per_kv = hq // hkv
+    for qh in range(hq):
+        kvh = qh // q_per_kv
+        for d in range(dim):
+            row = kvh * dim + d
+            off = _aissd_selector_quality_q_physical_byte_offset(
+                logical_row=row,
+                q_head=qh,
+                q_cols=hq,
+                element_bytes=2,
+                row_stride_bytes=q_row_stride,
+                layout=q_layout,
+            )
+            if off < 0 or off + 2 > q_memory_size:
+                raise RuntimeError(
+                    f"INT16 ABI q_block mapping exceeds payload qh={qh} d={d} off={off}"
+                )
+            struct.pack_into("<h", q_payload, off, int(q_active[qh, d].item()))
+
+    k_memory_size = int(meta["k"]["memory_size"])
+    k_chunk_bytes = int(meta["k"]["chunk_bytes"])
+    k_row_stride = int(meta["k"]["row_stride_bytes"])
+    if k_memory_size != bucket * k_chunk_bytes:
+        raise RuntimeError(
+            f"INT16 ABI K memory={k_memory_size} != bucket*chunk={bucket*k_chunk_bytes}"
+        )
+    k_payload = bytearray(struct.pack("<h", k_zp) * (k_memory_size // 2))
+    int16_qk = torch.zeros((bucket, chunk, hq), dtype=torch.float32)
+    k_clamped_low = 0
+    k_clamped_high = 0
+    source_k_dtypes: set[str] = set()
+    source_formats: set[str] = set()
+    physical_token_lengths: list[int] = []
+    q_center = q_active.to(torch.float64) - float(q_zp)
+    compiled_qk_scale = float(k_scale * q_scale / (float(dim) ** 0.5))
+
+    for c, rec in enumerate(candidates):
+        source_path = str(rec.get("source_path") or "")
+        if not source_path:
+            raise RuntimeError(f"INT16 ABI candidate {c} lacks source_path")
+        k_raw, k_dtype, source_fmt = _aissd_selector_quality_read_source_k(
+            source_path, int(layer_id), hkv, dim
+        )
+        source_k_dtypes.add(str(k_dtype))
+        source_formats.add(str(source_fmt))
+        rows = min(chunk, int(k_raw.shape[0]))
+        physical_token_lengths.append(rows)
+        k_chunk = torch.zeros((chunk, hkv, dim), dtype=k_raw.dtype)
+        if rows:
+            k_chunk[:rows].copy_(k_raw[:rows])
+        k_i16, k_chunk_payload, low, high = _aissd_selector_quality_pack_k_int16(
+            k_chunk,
+            scale=k_scale,
+            zero_point=k_zp,
+            row_stride_bytes=k_row_stride,
+        )
+        if len(k_chunk_payload) != k_chunk_bytes:
+            raise RuntimeError(
+                f"INT16 ABI packed K candidate={c} bytes={len(k_chunk_payload)} "
+                f"expected={k_chunk_bytes}"
+            )
+        start = c * k_chunk_bytes
+        k_payload[start : start + k_chunk_bytes] = k_chunk_payload
+        k_clamped_low += int(low)
+        k_clamped_high += int(high)
+
+        k_center = k_i16.to(torch.float64) - float(k_zp)
+        for kvh in range(hkv):
+            q0 = kvh * q_per_kv
+            q1 = q0 + q_per_kv
+            # Float64 represents this 128-term INT16 dot product exactly for
+            # the current ABI range, then the compiler scale is applied once.
+            block = torch.matmul(
+                k_center[:, kvh, :], q_center[q0:q1, :].transpose(0, 1)
+            )
+            int16_qk[c, :, q0:q1] = (
+                block * compiled_qk_scale
+            ).to(torch.float32)
+
+    # Existing Stage-A reference is [Hq,valid_T] per candidate.  Rebuild its
+    # compiled [C,T,Hq] view and mask so A->B QK error excludes logical padding.
+    float_qk = torch.zeros_like(int16_qk)
+    valid_mask = torch.zeros_like(int16_qk, dtype=torch.bool)
+    valid_lengths: list[int] = []
+    for c, scores in enumerate(score_chunks[:candidate_count]):
+        valid = min(chunk, int(scores.shape[1]))
+        valid_lengths.append(valid)
+        if valid:
+            float_qk[c, :valid, :].copy_(scores[:, :valid].transpose(0, 1))
+            valid_mask[c, :valid, :] = True
+
+    float_same = _aissd_selector_quality_same_algorithm(
+        [float_qk[c].transpose(0, 1) for c in range(candidate_count)],
+        ssd_selected,
+        candidates,
+        top_n=top_n,
+        top_m=top_m,
+        score_mode_code=score_mode_code,
+        chunk_size=chunk,
+        num_heads=hq,
+        store_all_scores=True,
+    )
+    int16_same = _aissd_selector_quality_same_algorithm(
+        [int16_qk[c].transpose(0, 1) for c in range(candidate_count)],
+        ssd_selected,
+        candidates,
+        top_n=top_n,
+        top_m=top_m,
+        score_mode_code=score_mode_code,
+        chunk_size=chunk,
+        num_heads=hq,
+        store_all_scores=True,
+    )
+    float_scores = torch.tensor(float_same["cpu_chunk_scores"], dtype=torch.float32)
+    int16_scores = torch.tensor(int16_same["cpu_chunk_scores"], dtype=torch.float32)
+    a_to_b = {
+        "qk_valid_values": _aissd_selector_quality_error_metrics(
+            float_qk, int16_qk, mask=valid_mask
+        ),
+        "candidate_scores": _aissd_selector_quality_error_metrics(
+            float_scores, int16_scores
+        ),
+        "topn": _aissd_selector_quality_topn_pair(
+            float_same["cpu_topn_ids"], int16_same["cpu_topn_ids"]
+        ),
+    }
+
+    store_all = _env_flag(
+        "AISSD_SELECTOR_QUALITY_INT16_ABI_STORE_ALL_SCORES", "0"
+    )
+    if not store_all:
+        float_same.pop("cpu_chunk_scores", None)
+        int16_same.pop("cpu_chunk_scores", None)
+
+    q_bytes = bytes(q_payload)
+    k_bytes = bytes(k_payload)
+    float_qk_bytes = _aissd_selector_quality_tensor_bytes(float_qk)
+    int16_qk_bytes = _aissd_selector_quality_tensor_bytes(int16_qk)
+    int16_score_bytes = _aissd_selector_quality_tensor_bytes(int16_scores)
+    dump_paths: dict[str, str | None] = {
+        "packed_k_input": None,
+        "packed_q_input": None,
+        "float_qk": None,
+        "int16_qk": None,
+        "int16_chunk_scores": None,
+        "metadata": None,
+    }
+
+    result: dict[str, Any] = {
+        "schema_version": 1,
+        "record_type": "aissd_selector_int16_abi_reference",
+        "diagnostic_only": True,
+        "req_id": str(req_id),
+        "request_ordinal": int(request_ordinal),
+        "decode_step": int(decode_step),
+        "layer_id": int(layer_id),
+        "candidate_count": int(candidate_count),
+        "compiled_bucket": int(bucket),
+        "chunk_size": int(chunk),
+        "num_q_heads": int(hq),
+        "num_kv_heads": int(hkv),
+        "head_size": int(dim),
+        "abi_path": str(meta["abi_path"]),
+        "algorithm": _aissd_selector_quality_same_algo_name(),
+        "score_mode_code": int(score_mode_code),
+        "top_m": int(top_m),
+        "top_n": int(top_n),
+        "attention_scale_from_runtime": float(attention_scale),
+        "compiled_qk_scale": float(1.0 / (float(dim) ** 0.5)),
+        "combined_int16_dequant_scale": float(compiled_qk_scale),
+        "k_scale": float(k_scale),
+        "k_zero_point": int(k_zp),
+        "q_scale": float(q_scale),
+        "q_zero_point": int(q_zp),
+        "k_shape": [int(bucket), int(chunk), int(hkv * dim)],
+        "q_physical_shape": (
+            [
+                int((q_rows + int(q_layout["channel_block"]) - 1)
+                    // int(q_layout["channel_block"])),
+                int(hq),
+                int(q_layout["channel_block"]),
+            ]
+            if bool(q_layout["blocking_nhwc"])
+            else [int(hq), int(q_row_stride // 2)]
+        ),
+        "q_logical_shape": [int(hkv * dim), int(hq)],
+        "q_physical_layout": str(q_layout["name"]),
+        "q_physical_channel_block": int(q_layout["channel_block"]),
+        "q_row_stride_bytes": int(q_row_stride),
+        "output_shape": [int(bucket), int(chunk), int(hq)],
+        "valid_token_lengths": valid_lengths,
+        "physical_source_token_lengths": physical_token_lengths,
+        "source_k_dtypes": sorted(source_k_dtypes),
+        "source_formats": sorted(source_formats),
+        "q_clamped_low_count": int(q_clamped_low),
+        "q_clamped_high_count": int(q_clamped_high),
+        "k_clamped_low_count": int(k_clamped_low),
+        "k_clamped_high_count": int(k_clamped_high),
+        "packed_k_bytes": len(k_bytes),
+        "packed_q_bytes": len(q_bytes),
+        "qk_bytes": len(int16_qk_bytes),
+        "packed_k_sha256": hashlib.sha256(k_bytes).hexdigest(),
+        "packed_q_sha256": hashlib.sha256(q_bytes).hexdigest(),
+        "float_qk_sha256": hashlib.sha256(float_qk_bytes).hexdigest(),
+        "int16_qk_sha256": hashlib.sha256(int16_qk_bytes).hexdigest(),
+        "int16_chunk_scores_sha256": hashlib.sha256(
+            int16_score_bytes
+        ).hexdigest(),
+        "a_to_b_float_vs_int16": a_to_b,
+        "float_same_algorithm": float_same,
+        "int16_same_algorithm": int16_same,
+        "dump_paths": dump_paths,
+    }
+
+    if _env_flag("AISSD_SELECTOR_QUALITY_INT16_ABI_DUMP_QK", "0"):
+        dump_dir = os.path.abspath(
+            str(
+                os.environ.get(
+                    "AISSD_SELECTOR_QUALITY_INT16_ABI_DUMP_DIR",
+                    "/tmp/aissd_int16_abi_trace",
+                )
+            ).strip()
+        )
+        stem = (
+            f"req{int(request_ordinal)}.step{int(decode_step)}."
+            f"l{int(layer_id)}.bucket{int(bucket)}"
+        )
+        names = {
+            "packed_k_input": f"host_expected.packed_k.{stem}.int16.bin",
+            "packed_q_input": f"host_expected.packed_q.{stem}.int16.bin",
+            "float_qk": f"host_expected.float_qk.{stem}.float32.bin",
+            "int16_qk": f"host_expected.int16_qk.{stem}.float32.bin",
+            "int16_chunk_scores": (
+                f"host_expected.int16_chunk_scores.{stem}.float32.bin"
+            ),
+            "metadata": f"host_expected.int16_abi.{stem}.json",
+        }
+        blobs = {
+            "packed_k_input": k_bytes,
+            "packed_q_input": q_bytes,
+            "float_qk": float_qk_bytes,
+            "int16_qk": int16_qk_bytes,
+            "int16_chunk_scores": int16_score_bytes,
+        }
+        for key, blob in blobs.items():
+            path = os.path.join(dump_dir, names[key])
+            _aissd_selector_quality_write_trace_bytes(path, blob)
+            dump_paths[key] = path
+        metadata_path = os.path.join(dump_dir, names["metadata"])
+        dump_paths["metadata"] = metadata_path
+        _aissd_selector_quality_write_trace_bytes(
+            metadata_path,
+            (json.dumps(result, sort_keys=True, indent=2) + "\n").encode("utf-8"),
+        )
+
     return result
 
 
@@ -2468,6 +3205,7 @@ def _aissd_maybe_trace_selector_quality(
             else (requested_mode,)
         )
         references: dict[str, dict[str, Any]] = {}
+        reference_score_chunks: dict[str, list[torch.Tensor]] = {}
         for mode in modes:
             masses, ref_meta, score_chunks = _aissd_selector_quality_dense_masses(
                 q_view[r],
@@ -2503,14 +3241,41 @@ def _aissd_maybe_trace_selector_quality(
                 **metrics,
                 "same_algorithm": same_algorithm,
             }
+            reference_score_chunks[mode] = score_chunks
 
         # Production is the primary ground truth whenever it was requested.
         primary_mode = "production" if "production" in references else "fp32"
         primary = references[primary_mode]
-        elapsed_ms = (time.perf_counter() - t0) * 1000.0
         same_algorithm_primary = primary.get("same_algorithm")
+        int16_abi_reference = None
+        if _aissd_selector_quality_int16_abi_matches(
+            request_ordinal=int(req_ordinal),
+            decode_step=int(decode_step),
+            layer_id=int(layer_id),
+        ):
+            int16_abi_reference = (
+                _aissd_selector_quality_build_int16_abi_reference(
+                    req_id=req_id,
+                    request_ordinal=int(req_ordinal),
+                    decode_step=int(decode_step),
+                    layer_id=int(layer_id),
+                    q_row=q_view[r],
+                    candidates=candidates,
+                    score_chunks=reference_score_chunks[primary_mode],
+                    ssd_selected=ssd_selected,
+                    num_heads=int(num_heads),
+                    num_kv_heads=int(num_kv_heads),
+                    head_size=int(head_size),
+                    attention_scale=float(attention_scale),
+                    top_n=int(top_n),
+                    top_m=int(top_m),
+                    score_mode_code=int(score_mode_code),
+                    chunk_size=int(chunk_size),
+                )
+            )
+        elapsed_ms = (time.perf_counter() - t0) * 1000.0
         record = {
-            "schema_version": 4,
+            "schema_version": 5,
             "tag": trace_tag,
             "req_id": req_id,
             "request_ordinal": int(req_ordinal),
@@ -2541,6 +3306,7 @@ def _aissd_maybe_trace_selector_quality(
             "candidate_mass_sum": float(primary["candidate_mass_sum"]),
             # Primary-mode alias for NPU-vs-CPU exact-selector comparison.
             "same_algorithm_reference": same_algorithm_primary,
+            "int16_abi_reference": int16_abi_reference,
             "lmcache_cached_tokens": int(cached_tokens),
             "trace_elapsed_ms": float(elapsed_ms),
         }
@@ -2548,6 +3314,26 @@ def _aissd_maybe_trace_selector_quality(
             record["k_layout_trace"] = k_layout_trace
         if isinstance(q_layout_trace, dict):
             record["q_layout_trace"] = q_layout_trace
+        if isinstance(int16_abi_reference, dict):
+            record.update(
+                {
+                    "int16_abi_topn_recall_vs_float": float(
+                        int16_abi_reference["a_to_b_float_vs_int16"]["topn"][
+                            "recall"
+                        ]
+                    ),
+                    "int16_abi_exact_set_vs_float": bool(
+                        int16_abi_reference["a_to_b_float_vs_int16"]["topn"][
+                            "exact_set_match"
+                        ]
+                    ),
+                    "int16_abi_exact_order_vs_float": bool(
+                        int16_abi_reference["a_to_b_float_vs_int16"]["topn"][
+                            "exact_order_match"
+                        ]
+                    ),
+                }
+            )
         if isinstance(same_algorithm_primary, dict):
             record.update(
                 {
@@ -2612,6 +3398,34 @@ def _aissd_maybe_trace_selector_quality(
                 float(same_algorithm_primary["cpu_score_regret_normalized"]),
                 same_algorithm_primary["cpu_topn_ids"],
                 same_algorithm_primary["ssd_topn_candidate_ids"],
+            )
+        if isinstance(int16_abi_reference, dict):
+            a_to_b = int16_abi_reference["a_to_b_float_vs_int16"]
+            logger.info(
+                "[aissd-selector-int16-abi] req=%s decode_step=%d layer=%d "
+                "bucket=%d candidates=%d q_clip=%d/%d k_clip=%d/%d "
+                "qk_mae=%.9g qk_max_abs=%.9g qk_cos=%.9g "
+                "score_mae=%.9g topn_overlap=%d/%d exact_set=%s "
+                "exact_order=%s float_topn=%s int16_topn=%s",
+                req_id,
+                decode_step,
+                int(layer_id),
+                int(int16_abi_reference["compiled_bucket"]),
+                int(int16_abi_reference["candidate_count"]),
+                int(int16_abi_reference["q_clamped_low_count"]),
+                int(int16_abi_reference["q_clamped_high_count"]),
+                int(int16_abi_reference["k_clamped_low_count"]),
+                int(int16_abi_reference["k_clamped_high_count"]),
+                float(a_to_b["qk_valid_values"]["mean_abs_error"]),
+                float(a_to_b["qk_valid_values"]["max_abs_error"]),
+                float(a_to_b["qk_valid_values"]["cosine_similarity"]),
+                float(a_to_b["candidate_scores"]["mean_abs_error"]),
+                int(a_to_b["topn"]["overlap_count"]),
+                int(top_n),
+                bool(a_to_b["topn"]["exact_set_match"]),
+                bool(a_to_b["topn"]["exact_order_match"]),
+                a_to_b["topn"]["reference_topn_ids"],
+                a_to_b["topn"]["actual_topn_ids"],
             )
         if requested_mode == "both":
             prod = references["production"]
