@@ -18,6 +18,7 @@ from typing import Any
 import copy
 import hashlib
 import json
+import math
 import os
 import struct
 import threading
@@ -416,6 +417,193 @@ def _aissd_selector_quality_trace_layers() -> set[int] | None:
         if not part:
             continue
         result.add(int(part))
+    return result
+
+
+def _aissd_selector_quality_oracle_mass_curve_enabled() -> bool:
+    """Whether Dense-Oracle cumulative-mass diagnostics are emitted.
+
+    This is evaluated only inside the already-expensive selector-quality trace
+    path.  It reuses the per-candidate Dense-Oracle masses and performs no
+    additional K reads, QK matmuls, or softmax operations.
+    """
+    return _env_flag("AISSD_SELECTOR_QUALITY_ORACLE_MASS_CURVE", "1")
+
+
+def _aissd_selector_quality_oracle_store_full_curve() -> bool:
+    """Store cumulative normalized mass for every Top-N value.
+
+    Keeping the full curve makes the offline report able to answer arbitrary
+    Top-N questions exactly.  Disable this only when minimizing JSONL size is
+    more important than retaining the complete curve.
+    """
+    return _env_flag("AISSD_SELECTOR_QUALITY_ORACLE_STORE_FULL_CURVE", "1")
+
+
+def _aissd_selector_quality_oracle_topn_points() -> list[int]:
+    name = "AISSD_SELECTOR_QUALITY_ORACLE_MASS_TOPNS"
+    raw = str(
+        os.environ.get(name, "1,2,4,8,12,16,24,32,48,64,96,128")
+    ).strip()
+    result: set[int] = set()
+    for part in raw.split(","):
+        part = part.strip()
+        if not part:
+            continue
+        try:
+            value = int(part, 0)
+        except ValueError as exc:
+            raise RuntimeError(f"{name} contains invalid integer {part!r}") from exc
+        if value <= 0:
+            raise RuntimeError(f"{name} values must be positive, got {value}")
+        result.add(value)
+    if not result:
+        raise RuntimeError(f"{name} must contain at least one positive integer")
+    return sorted(result)
+
+
+def _aissd_selector_quality_oracle_mass_targets() -> list[float]:
+    name = "AISSD_SELECTOR_QUALITY_ORACLE_MASS_TARGETS"
+    raw = str(os.environ.get(name, "0.5,0.6,0.7,0.8,0.9,0.95")).strip()
+    result: set[float] = {0.8}  # N80 is always available, even with a custom list.
+    for part in raw.split(","):
+        part = part.strip()
+        if not part:
+            continue
+        try:
+            value = float(part)
+        except ValueError as exc:
+            raise RuntimeError(f"{name} contains invalid float {part!r}") from exc
+        if not math.isfinite(value) or not (0.0 < value <= 1.0):
+            raise RuntimeError(
+                f"{name} values must be finite fractions in (0, 1], got {value}"
+            )
+        # Normalization avoids duplicate entries caused by textual spellings
+        # such as 0.8 and 0.80 while retaining more precision than needed here.
+        result.add(round(value, 12))
+    return sorted(result)
+
+
+def _aissd_selector_quality_oracle_mass_curve(
+    masses: list[float],
+    *,
+    current_top_n: int,
+) -> dict[str, Any]:
+    """Build the exact Dense-Oracle cumulative mass curve for one record.
+
+    N80 is the minimum number of chunks required after sorting chunks by their
+    true Dense-Oracle attention mass.  Mass is normalized by the total mass in
+    the LMCache SSD candidate pool, so N80 is scoped to that pool rather than
+    to tokens that are outside it (for example, separately resident/recent KV).
+    """
+    if not masses:
+        raise RuntimeError("selector-quality Oracle mass curve has no candidates")
+
+    clean_masses: list[float] = []
+    for index, raw_mass in enumerate(masses):
+        value = float(raw_mass)
+        if not math.isfinite(value):
+            raise RuntimeError(
+                "selector-quality Oracle mass is not finite: "
+                f"candidate={index} value={value}"
+            )
+        if value < -1.0e-12:
+            raise RuntimeError(
+                "selector-quality Oracle mass is negative: "
+                f"candidate={index} value={value}"
+            )
+        clean_masses.append(max(0.0, value))
+
+    mass_sum = float(sum(clean_masses))
+    if not math.isfinite(mass_sum) or mass_sum <= 0.0:
+        raise RuntimeError(
+            f"selector-quality Oracle candidate mass sum is invalid: {mass_sum}"
+        )
+
+    # Candidate index is an explicit deterministic tie-breaker.  Ties do not
+    # change the cumulative mass, but deterministic ordering makes traces
+    # reproducible and allows optional full-rank inspection.
+    ranked_ids = sorted(
+        range(len(clean_masses)),
+        key=lambda index: (-clean_masses[index], index),
+    )
+    cumulative_mass: list[float] = []
+    running = 0.0
+    for candidate_id in ranked_ids:
+        running += clean_masses[candidate_id]
+        cumulative_mass.append(float(running))
+    cumulative_normalized = [
+        float(value / mass_sum) for value in cumulative_mass
+    ]
+
+    requested_points = set(_aissd_selector_quality_oracle_topn_points())
+    requested_points.add(max(1, int(current_top_n)))
+    requested_points.add(len(clean_masses))
+    mass_at_topn: list[dict[str, Any]] = []
+    for requested_top_n in sorted(requested_points):
+        effective_top_n = min(int(requested_top_n), len(clean_masses))
+        mass = cumulative_mass[effective_top_n - 1]
+        mass_at_topn.append(
+            {
+                "requested_top_n": int(requested_top_n),
+                "effective_top_n": int(effective_top_n),
+                "clamped_to_candidate_count": bool(
+                    effective_top_n != int(requested_top_n)
+                ),
+                "mass": float(mass),
+                "normalized_mass": float(mass / mass_sum),
+            }
+        )
+
+    tolerance = max(1.0e-15, abs(mass_sum) * 1.0e-12)
+    n_by_target: list[dict[str, Any]] = []
+    for target in _aissd_selector_quality_oracle_mass_targets():
+        threshold = float(target) * mass_sum
+        min_top_n = len(cumulative_mass)
+        for rank, value in enumerate(cumulative_mass, start=1):
+            if value + tolerance >= threshold:
+                min_top_n = rank
+                break
+        achieved_mass = cumulative_mass[min_top_n - 1]
+        n_by_target.append(
+            {
+                "target_mass": float(target),
+                "min_top_n": int(min_top_n),
+                "min_top_n_fraction": float(min_top_n / len(clean_masses)),
+                "achieved_mass": float(achieved_mass),
+                "normalized_achieved_mass": float(achieved_mass / mass_sum),
+            }
+        )
+
+    n80_record = next(
+        item
+        for item in n_by_target
+        if abs(float(item["target_mass"]) - 0.8) < 1e-12
+    )
+    result: dict[str, Any] = {
+        "schema_version": 1,
+        "scope": "lmcache_ssd_candidate_pool",
+        "normalization": "candidate_mass_sum",
+        "candidate_count": int(len(clean_masses)),
+        "candidate_mass_sum": float(mass_sum),
+        "current_top_n": int(current_top_n),
+        "mass_at_topn": mass_at_topn,
+        "n_by_target": n_by_target,
+        "n80": int(n80_record["min_top_n"]),
+        "n80_fraction": float(n80_record["min_top_n_fraction"]),
+        "n80_achieved_mass": float(n80_record["achieved_mass"]),
+        "n80_normalized_achieved_mass": float(
+            n80_record["normalized_achieved_mass"]
+        ),
+        "full_curve_stored": bool(
+            _aissd_selector_quality_oracle_store_full_curve()
+        ),
+    }
+    if result["full_curve_stored"]:
+        # Element i is Oracle mass at Top-(i+1).  Candidate IDs are omitted to
+        # keep the trace compact; the current production Top-N IDs remain in
+        # the existing oracle_topn field.
+        result["full_cumulative_mass_normalized"] = cumulative_normalized
     return result
 
 
@@ -2918,7 +3106,7 @@ def _aissd_selector_quality_metrics(
         if oracle_k > 0
         else 0.0
     )
-    return {
+    result: dict[str, Any] = {
         "ssd_selected_count": int(len(ssd_ids)),
         "ssd_selected": _aissd_selector_quality_compact_chunks(
             ssd_ids, candidates, masses
@@ -2932,6 +3120,16 @@ def _aissd_selector_quality_metrics(
         "selection_regret": float(oracle_mass - ssd_mass),
         "candidate_mass_sum": float(sum(masses)),
     }
+    if _aissd_selector_quality_oracle_mass_curve_enabled():
+        oracle_curve = _aissd_selector_quality_oracle_mass_curve(
+            masses,
+            current_top_n=int(top_n),
+        )
+        result["oracle_mass_curve"] = oracle_curve
+        # Convenient scalar aliases for common jq/CSV use.  The complete,
+        # configurable target table remains under oracle_mass_curve.
+        result["oracle_n80"] = int(oracle_curve["n80"])
+    return result
 
 
 def _aissd_selector_quality_candidate_indices_from_rpc(
@@ -3275,7 +3473,7 @@ def _aissd_maybe_trace_selector_quality(
             )
         elapsed_ms = (time.perf_counter() - t0) * 1000.0
         record = {
-            "schema_version": 5,
+            "schema_version": 6,
             "tag": trace_tag,
             "req_id": req_id,
             "request_ordinal": int(req_ordinal),
@@ -3310,6 +3508,15 @@ def _aissd_maybe_trace_selector_quality(
             "lmcache_cached_tokens": int(cached_tokens),
             "trace_elapsed_ms": float(elapsed_ms),
         }
+        primary_oracle_curve = primary.get("oracle_mass_curve")
+        if isinstance(primary_oracle_curve, dict):
+            # Keep the full curve only in references[primary_mode] to avoid
+            # duplicating it in every JSONL record.  These aliases keep the
+            # most common primary-reference queries short.
+            record["oracle_n80"] = int(primary_oracle_curve["n80"])
+            record["oracle_n80_fraction"] = float(
+                primary_oracle_curve["n80_fraction"]
+            )
         if isinstance(k_layout_trace, dict):
             record["k_layout_trace"] = k_layout_trace
         if isinstance(q_layout_trace, dict):
@@ -3375,6 +3582,28 @@ def _aissd_maybe_trace_selector_quality(
             float(primary["selection_regret"]),
             elapsed_ms,
         )
+        if isinstance(primary_oracle_curve, dict):
+            compact_curve = [
+                (
+                    int(item["requested_top_n"]),
+                    float(item["normalized_mass"]),
+                )
+                for item in primary_oracle_curve["mass_at_topn"]
+            ]
+            logger.info(
+                "[aissd-selector-oracle-curve] req=%s decode_step=%d layer=%d "
+                "candidates=%d ref=%s n80=%d n80_fraction=%.6f "
+                "mass_at_topn=%s full_curve=%s",
+                req_id,
+                decode_step,
+                int(layer_id),
+                candidate_count,
+                primary_mode,
+                int(primary_oracle_curve["n80"]),
+                float(primary_oracle_curve["n80_fraction"]),
+                compact_curve,
+                bool(primary_oracle_curve["full_curve_stored"]),
+            )
         if isinstance(same_algorithm_primary, dict):
             logger.info(
                 "[aissd-selector-same-algo] req=%s decode_step=%d layer=%d "
