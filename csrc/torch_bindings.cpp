@@ -80,7 +80,8 @@ TORCH_LIBRARY_EXPAND(TORCH_EXTENSION_NAME, ops) {
       "Tensor active_reqs, Tensor req_token_lens, Tensor req_vllm_cached_tokens, "
       "Tensor req_lmcache_cached_tokens, Tensor req_slot_lens, "
       "Tensor slot_mapping_table, Tensor selected_block_table, "
-      "Tensor selected_block_lens, Tensor selected_ready_flags, "
+      "Tensor selected_block_lens, Tensor selected_token_lens, "
+      "Tensor selected_ready_flags, "
       "Tensor debug_counters, "
       "int block_size, int chunk_size, int top_n_chunks, float scale) -> ()");
 
@@ -98,10 +99,13 @@ TORCH_LIBRARY_EXPAND(TORCH_EXTENSION_NAME, ops) {
       "Tensor aissd_candidate_fmt, Tensor aissd_candidate_ndim, "
       "Tensor aissd_candidate_shape, Tensor aissd_candidate_extent_count, "
       "Tensor aissd_candidate_extent_lba, Tensor aissd_candidate_extent_bytes, "
+      "Tensor local_block_table, Tensor local_block_lens, "
+      "Tensor local_token_lens, "
       "Tensor(a!) selected_block_table, Tensor(b!) selected_block_lens, "
       "Tensor(c!) selected_ready_flags, Tensor(d!) fa_block_table, "
-      "Tensor(e!) fa_seq_lens, Tensor(f!) aissd_rpc_selected_chunk_ids, "
-      "Tensor(g!) aissd_rpc_selected_chunk_lens, int layer_id, int backend, int num_q_heads, "
+      "Tensor(e!) fa_block_lens, Tensor(f!) fa_seq_lens, "
+      "Tensor(g!) aissd_rpc_selected_chunk_ids, "
+      "Tensor(h!) aissd_rpc_selected_chunk_lens, int layer_id, int backend, int num_q_heads, "
       "int num_kv_heads, int head_dim, int chunk_size, int block_size, "
       "int top_n_chunks, int top_m, int score_mode, int manifest_block_size, "
       "int timeout_ms) -> ()");

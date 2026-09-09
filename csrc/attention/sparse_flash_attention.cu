@@ -129,6 +129,7 @@ __global__ void sparse_flash_attention_kernel(
     const int32_t* __restrict__ req_token_lens,
     const int32_t* __restrict__ selected_block_table,
     const int32_t* __restrict__ selected_block_lens,
+    const int32_t* __restrict__ selected_token_lens,
     const int32_t* __restrict__ selected_ready_flags,
     int64_t* __restrict__ debug_counters,
     int debug_enabled,
@@ -165,6 +166,7 @@ __global__ void sparse_flash_attention_kernel(
   const bool valid_req = (req >= 0 && req < active);
   const int ready = valid_req ? selected_ready_flags[req] : 0;
   const int selected_len = valid_req ? selected_block_lens[req] : 0;
+  const int selected_tokens = valid_req ? selected_token_lens[req] : 0;
 
   if (debug_enabled && tid == 0) {
     // debug_counters layout, accumulated per op call after Python zero_():
@@ -180,7 +182,7 @@ __global__ void sparse_flash_attention_kernel(
     debug_atomic_max(debug_counters, 6, static_cast<unsigned long long>(max(active, 0)));
   }
 
-  if (!valid_req || ready == 0 || selected_len <= 0) {
+  if (!valid_req || ready == 0 || selected_len <= 0 || selected_tokens <= 0) {
     if (debug_enabled && tid == 0) {
       debug_atomic_add(debug_counters, 4, 1ULL);
     }
@@ -216,8 +218,7 @@ __global__ void sparse_flash_attention_kernel(
     debug_atomic_add(debug_counters, 1, 1ULL);
     debug_atomic_add(debug_counters, 2, static_cast<unsigned long long>(bounded_selected_len));
     debug_atomic_add(debug_counters, 3,
-                     static_cast<unsigned long long>(bounded_selected_len) *
-                         static_cast<unsigned long long>(block_size));
+                     static_cast<unsigned long long>(max(selected_tokens, 0)));
     debug_atomic_max(debug_counters, 7,
                      static_cast<unsigned long long>(max(bounded_selected_len, 0)));
   }
@@ -232,6 +233,9 @@ __global__ void sparse_flash_attention_kernel(
     }
 
     for (int token_in_block = 0; token_in_block < block_size; ++token_in_block) {
+      if (bi * block_size + token_in_block >= selected_tokens) {
+        break;
+      }
       float partial = 0.0f;
       if (tid < head_dim) {
         const int64_t k_off = kv_offset<scalar_t>(
@@ -297,6 +301,7 @@ void sparse_flash_attention(
     const at::Tensor& slot_mapping_table,
     const at::Tensor& selected_block_table,
     const at::Tensor& selected_block_lens,
+    const at::Tensor& selected_token_lens,
     const at::Tensor& selected_ready_flags,
     const at::Tensor& debug_counters,
     int64_t block_size,
@@ -317,6 +322,7 @@ void sparse_flash_attention(
   TORCH_CHECK(req_token_lens.is_cuda(), "sparse_flash_attention: req_token_lens must be CUDA");
   TORCH_CHECK(selected_block_table.is_cuda(), "sparse_flash_attention: selected_block_table must be CUDA");
   TORCH_CHECK(selected_block_lens.is_cuda(), "sparse_flash_attention: selected_block_lens must be CUDA");
+  TORCH_CHECK(selected_token_lens.is_cuda(), "sparse_flash_attention: selected_token_lens must be CUDA");
   TORCH_CHECK(selected_ready_flags.is_cuda(), "sparse_flash_attention: selected_ready_flags must be CUDA");
   const bool debug_enabled = debug_counters.defined() && debug_counters.numel() >= 8;
   if (debug_enabled) {
@@ -331,7 +337,17 @@ void sparse_flash_attention(
   TORCH_CHECK(kv_cache.dim() == 5, "sparse_flash_attention: kv_cache must be 5-D");
   TORCH_CHECK(selected_block_table.dim() == 2, "sparse_flash_attention: selected_block_table must be [reqs, blocks]");
   TORCH_CHECK(selected_block_lens.dim() == 1, "sparse_flash_attention: selected_block_lens must be [reqs]");
+  TORCH_CHECK(selected_token_lens.dim() == 1, "sparse_flash_attention: selected_token_lens must be [reqs]");
   TORCH_CHECK(selected_ready_flags.dim() == 1, "sparse_flash_attention: selected_ready_flags must be [reqs]");
+  TORCH_CHECK(selected_block_table.scalar_type() == at::kInt &&
+                  selected_block_lens.scalar_type() == at::kInt &&
+                  selected_token_lens.scalar_type() == at::kInt &&
+                  selected_ready_flags.scalar_type() == at::kInt,
+              "sparse_flash_attention: sparse metadata tensors must be int32");
+  TORCH_CHECK(selected_block_lens.numel() == selected_token_lens.numel() &&
+                  selected_block_lens.numel() == selected_ready_flags.numel() &&
+                  selected_block_table.size(0) == selected_block_lens.numel(),
+              "sparse_flash_attention: sparse metadata shape mismatch");
 
   const c10::cuda::CUDAGuard device_guard(query.device());
 
@@ -394,6 +410,7 @@ void sparse_flash_attention(
             req_token_lens.data_ptr<int32_t>(),
             selected_block_table.data_ptr<int32_t>(),
             selected_block_lens.data_ptr<int32_t>(),
+            selected_token_lens.data_ptr<int32_t>(),
             selected_ready_flags.data_ptr<int32_t>(),
             debug_enabled ? debug_counters.data_ptr<int64_t>() : nullptr,
             debug_enabled ? 1 : 0,
@@ -773,10 +790,14 @@ void aissd_sparse_kv_select(
     const at::Tensor& aissd_candidate_extent_count,
     const at::Tensor& aissd_candidate_extent_lba,
     const at::Tensor& aissd_candidate_extent_bytes,
+    const at::Tensor& local_block_table,
+    const at::Tensor& local_block_lens,
+    const at::Tensor& local_token_lens,
     at::Tensor& selected_block_table,
     at::Tensor& selected_block_lens,
     at::Tensor& selected_ready_flags,
     at::Tensor& fa_block_table,
+    at::Tensor& fa_block_lens,
     at::Tensor& fa_seq_lens,
     at::Tensor& aissd_rpc_selected_chunk_ids,
     at::Tensor& aissd_rpc_selected_chunk_lens,
@@ -793,11 +814,20 @@ void aissd_sparse_kv_select(
     int64_t manifest_block_size,
     int64_t timeout_ms) {
   TORCH_CHECK(query.is_cuda(), "aissd_sparse_kv_select: query must be CUDA");
+  TORCH_CHECK(local_block_table.is_cuda() && local_block_lens.is_cuda() &&
+                  local_token_lens.is_cuda(),
+              "aissd_sparse_kv_select: local-tail metadata tensors must be CUDA");
   TORCH_CHECK(selected_block_table.is_cuda() && selected_block_lens.is_cuda() &&
-                  selected_ready_flags.is_cuda() && fa_block_table.is_cuda() && fa_seq_lens.is_cuda(),
+                  selected_ready_flags.is_cuda() && fa_block_table.is_cuda() &&
+                  fa_block_lens.is_cuda() && fa_seq_lens.is_cuda(),
               "aissd_sparse_kv_select: output metadata tensors must be CUDA");
+  TORCH_CHECK(local_block_table.scalar_type() == at::kInt &&
+                  local_block_lens.scalar_type() == at::kInt &&
+                  local_token_lens.scalar_type() == at::kInt,
+              "aissd_sparse_kv_select: local-tail metadata tensors must be int32");
   TORCH_CHECK(selected_block_table.scalar_type() == at::kInt && selected_block_lens.scalar_type() == at::kInt &&
                   selected_ready_flags.scalar_type() == at::kInt && fa_block_table.scalar_type() == at::kInt &&
+                  fa_block_lens.scalar_type() == at::kInt &&
                   fa_seq_lens.scalar_type() == at::kInt,
               "aissd_sparse_kv_select: selected/fa metadata tensors must be int32");
   TORCH_CHECK(selected_block_table.dim() == 2 && fa_block_table.dim() == 2 &&
@@ -806,6 +836,13 @@ void aissd_sparse_kv_select(
               "aissd_sparse_kv_select: fa_block_table shape must match selected_block_table");
   TORCH_CHECK(selected_block_lens.numel() == fa_seq_lens.numel(),
               "aissd_sparse_kv_select: fa_seq_lens length must match selected_block_lens");
+  TORCH_CHECK(local_block_table.dim() == 2 &&
+                  local_block_table.size(0) == selected_block_table.size(0) &&
+                  local_block_table.size(1) == selected_block_table.size(1) &&
+                  local_block_lens.numel() == selected_block_lens.numel() &&
+                  local_token_lens.numel() == selected_block_lens.numel() &&
+                  fa_block_lens.numel() == selected_block_lens.numel(),
+              "aissd_sparse_kv_select: local/fa block metadata shape mismatch");
 
   // Preserve the SSD RPC result itself for Phase-1 quality tracing. Do not
   // infer selected chunks back from selected_block_table: block IDs are an
@@ -850,6 +887,9 @@ void aissd_sparse_kv_select(
   // Materialize CPU metadata. LMCache normally prepares these on CPU; .cpu()
   // also keeps the call robust if a future path publishes pinned/CUDA tensors.
   auto req_lens_cpu = req_token_lens.cpu();
+  auto local_table_cpu = local_block_table.cpu();
+  auto local_block_lens_cpu = local_block_lens.cpu();
+  auto local_token_lens_cpu = local_token_lens.cpu();
   auto cand_count_cpu = aissd_candidate_count.cpu();
   auto chunk_ids_cpu = aissd_candidate_chunk_ids.cpu();
   auto block_ids_cpu = aissd_candidate_block_ids.cpu();
@@ -870,6 +910,7 @@ void aissd_sparse_kv_select(
   std::vector<int32_t> out_lens(selected_block_lens.numel(), 0);
   std::vector<int32_t> out_ready(selected_ready_flags.numel(), 0);
   std::vector<int32_t> out_fa_table(fa_block_table.numel(), 0);
+  std::vector<int32_t> out_fa_block_lens(fa_block_lens.numel(), 0);
   std::vector<int32_t> out_fa_lens(fa_seq_lens.numel(), 1);
 
   for (int64_t r = 0; r < reqs; ++r) {
@@ -994,9 +1035,62 @@ void aissd_sparse_kv_select(
       }
     }
     TORCH_CHECK(out_len > 0, "aissd_sparse_kv_select: SSD selected zero KV blocks");
+
+    const int64_t local_block_count =
+        aissd_elem_i64_cpu(local_block_lens_cpu, r);
+    const int64_t local_token_count =
+        aissd_elem_i64_cpu(local_token_lens_cpu, r);
+    TORCH_CHECK(local_block_count >= 0 && local_block_count <= max_blocks,
+                "aissd_sparse_kv_select: invalid local block count=",
+                local_block_count, " row=", r, " capacity=", max_blocks);
+    TORCH_CHECK(local_token_count >= 0,
+                "aissd_sparse_kv_select: negative local token count=",
+                local_token_count, " row=", r);
+    if (local_block_count == 0) {
+      TORCH_CHECK(local_token_count == 0,
+                  "aissd_sparse_kv_select: local tokens without local blocks, row=",
+                  r, " local_tokens=", local_token_count);
+    } else {
+      TORCH_CHECK(local_token_count > (local_block_count - 1) * block_size &&
+                      local_token_count <= local_block_count * block_size,
+                  "aissd_sparse_kv_select: local token/block length mismatch, row=",
+                  r, " local_tokens=", local_token_count,
+                  " local_blocks=", local_block_count,
+                  " block_size=", block_size);
+    }
+
+    int64_t fa_out_len = out_len;
+    const auto* local_ids = local_table_cpu.data_ptr<int32_t>();
+    const int64_t local_stride = local_block_table.size(1);
+    for (int64_t b = 0; b < local_block_count; ++b) {
+      const int32_t block_id = local_ids[r * local_stride + b];
+      TORCH_CHECK(block_id >= 0,
+                  "aissd_sparse_kv_select: negative local block id, row=",
+                  r, " local_index=", b);
+      bool overlaps_remote = false;
+      for (int64_t i = 0; i < out_len; ++i) {
+        if (out_fa_table[r * max_blocks + i] == block_id) {
+          overlaps_remote = true;
+          break;
+        }
+      }
+      TORCH_CHECK(!overlaps_remote,
+                  "aissd_sparse_kv_select: local block overlaps an SSD-selected "
+                  "remote block; LMCache boundary/block composition is invalid, row=",
+                  r, " block_id=", block_id);
+      TORCH_CHECK(fa_out_len < max_blocks,
+                  "aissd_sparse_kv_select: remote+local FA table exceeds capacity, row=",
+                  r, " remote_blocks=", out_len,
+                  " local_blocks=", local_block_count,
+                  " capacity=", max_blocks);
+      out_fa_table[r * max_blocks + fa_out_len] = block_id;
+      ++fa_out_len;
+    }
     out_lens[r] = static_cast<int32_t>(out_len);
     out_ready[r] = 1;
-    out_fa_lens[r] = static_cast<int32_t>(out_len * block_size);
+    out_fa_block_lens[r] = static_cast<int32_t>(fa_out_len);
+    out_fa_lens[r] = static_cast<int32_t>(
+        out_len * block_size + local_token_count);
   }
 
   aissd_check_cuda(cudaMemcpyAsync(selected_block_table.data_ptr(), out_table.data(),
@@ -1015,6 +1109,10 @@ void aissd_sparse_kv_select(
                                    fa_block_table.numel() * sizeof(int32_t),
                                    cudaMemcpyHostToDevice, stream),
                    "aissd_sparse_kv_select: copy fa_block_table H2D");
+  aissd_check_cuda(cudaMemcpyAsync(fa_block_lens.data_ptr(), out_fa_block_lens.data(),
+                                   fa_block_lens.numel() * sizeof(int32_t),
+                                   cudaMemcpyHostToDevice, stream),
+                   "aissd_sparse_kv_select: copy fa_block_lens H2D");
   aissd_check_cuda(cudaMemcpyAsync(fa_seq_lens.data_ptr(), out_fa_lens.data(),
                                    fa_seq_lens.numel() * sizeof(int32_t),
                                    cudaMemcpyHostToDevice, stream),

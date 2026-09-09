@@ -4495,7 +4495,17 @@ _AISSD_SELECTED_METADATA_KEYS = (
     "selected_block_lens",
     "selected_ready_flags",
     "fa_block_table",
+    "fa_block_lens",
     "fa_seq_lens",
+)
+
+
+_AISSD_SELECTED_HOST_DIAGNOSTIC_KEYS = (
+    "host_selected_blocks",
+    "host_selected_blocks_per_req",
+    "host_selected_chunks",
+    "host_selected_chunks_per_req",
+    "host_selected_blocks_source",
 )
 
 
@@ -4614,6 +4624,9 @@ def _aissd_cache_selected_metadata(
             raise RuntimeError(f"AISSD selected metadata cache missing tensor {key}")
         entry[key] = tensor.detach().clone()
         copy_bytes += int(tensor.numel()) * int(tensor.element_size())
+    for key in _AISSD_SELECTED_HOST_DIAGNOSTIC_KEYS:
+        if key in step_context:
+            entry[key] = step_context[key]
     _aissd_selected_cache(step_context)[int(source_layer_id)] = entry
     step_context["aissd_selected_metadata_active_layer_id"] = int(source_layer_id)
     step_context["aissd_selected_metadata_active_layer_name"] = str(source_layer_name)
@@ -4709,6 +4722,9 @@ def _aissd_restore_selected_metadata(
         dst.copy_(cached, non_blocking=True)
         copy_count += 1
         copy_bytes += int(cached.numel()) * int(cached.element_size())
+    for key in _AISSD_SELECTED_HOST_DIAGNOSTIC_KEYS:
+        if key in entry:
+            step_context[key] = entry[key]
     step_context["aissd_selected_metadata_active_layer_id"] = int(source_layer_id)
     step_context["aissd_selected_metadata_active_layer_name"] = str(
         entry.get("source_layer_name", source_layer_id)
@@ -4786,6 +4802,171 @@ def _aissd_ensure_rpc_selected_chunk_buffers(
     # lifetime semantics explicit if an RPC fails before publishing a result.
     ids.fill_(-1)
     lens.zero_()
+
+
+def _aissd_update_host_selected_block_diagnostics(
+    step_context: dict[str, Any],
+) -> None:
+    """Publish the exact SSD-selected block count without a CUDA sync.
+
+    ``host_selected_blocks`` is initialized while LMCache prepares the step,
+    before the q-aware SSD selector has run, so it is necessarily zero for the
+    SSD backends.  The selector bridge later returns the selected chunk IDs in
+    CPU tensors.  Reconstruct the block count from those IDs and the CPU-side
+    candidate metadata, mirroring the C++ bridge's chunk-to-block expansion.
+
+    Do not read ``selected_block_lens`` here: it is a CUDA tensor and calling
+    ``item()``/``cpu()`` merely for logging would introduce an extra stream
+    synchronization on every selector invocation.
+    """
+    tensor_names = (
+        "aissd_candidate_count",
+        "aissd_candidate_chunk_ids",
+        "aissd_candidate_block_ids",
+        "aissd_candidate_block_lens",
+        "aissd_rpc_selected_chunk_ids",
+        "aissd_rpc_selected_chunk_lens",
+    )
+    tensors = {name: step_context.get(name) for name in tensor_names}
+    if not all(isinstance(value, torch.Tensor) for value in tensors.values()):
+        return
+    if any(value.device.type != "cpu" for value in tensors.values()):
+        # These tensors are CPU-side in the native-extents path.  Refuse to
+        # copy a future CUDA variant implicitly, because this helper runs on the
+        # production path and must remain synchronization-free.
+        return
+
+    candidate_count = tensors["aissd_candidate_count"]
+    candidate_chunk_ids = tensors["aissd_candidate_chunk_ids"]
+    candidate_block_ids = tensors["aissd_candidate_block_ids"]
+    candidate_block_lens = tensors["aissd_candidate_block_lens"]
+    rpc_selected_chunk_ids = tensors["aissd_rpc_selected_chunk_ids"]
+    rpc_selected_chunk_lens = tensors["aissd_rpc_selected_chunk_lens"]
+
+    if (
+        candidate_count.dim() != 1
+        or candidate_chunk_ids.dim() != 2
+        or candidate_block_ids.dim() != 3
+        or candidate_block_lens.dim() != 2
+        or rpc_selected_chunk_ids.dim() != 2
+        or rpc_selected_chunk_lens.dim() != 1
+    ):
+        return
+
+    try:
+        active_reqs = max(0, int(step_context.get("host_active_reqs", 0) or 0))
+    except Exception:
+        active_reqs = 0
+    selected_block_table = step_context.get("selected_block_table")
+    if (
+        active_reqs <= 0
+        or not isinstance(selected_block_table, torch.Tensor)
+        or selected_block_table.dim() != 2
+    ):
+        return
+
+    rows = min(
+        active_reqs,
+        int(candidate_count.shape[0]),
+        int(candidate_chunk_ids.shape[0]),
+        int(candidate_block_ids.shape[0]),
+        int(candidate_block_lens.shape[0]),
+        int(rpc_selected_chunk_ids.shape[0]),
+        int(rpc_selected_chunk_lens.shape[0]),
+        int(selected_block_table.shape[0]),
+    )
+    if rows != active_reqs:
+        return
+
+    max_candidates = min(
+        int(candidate_chunk_ids.shape[1]),
+        int(candidate_block_ids.shape[1]),
+        int(candidate_block_lens.shape[1]),
+    )
+    max_blocks_per_candidate = int(candidate_block_ids.shape[2])
+    max_selected_chunks = int(rpc_selected_chunk_ids.shape[1])
+    max_output_blocks = int(selected_block_table.shape[1])
+
+    candidate_counts = candidate_count[:rows].tolist()
+    candidate_chunk_rows = candidate_chunk_ids[:rows, :max_candidates].tolist()
+    candidate_block_len_rows = candidate_block_lens[
+        :rows, :max_candidates
+    ].tolist()
+    candidate_block_id_rows = candidate_block_ids[
+        :rows, :max_candidates, :max_blocks_per_candidate
+    ].tolist()
+    selected_chunk_len_rows = rpc_selected_chunk_lens[:rows].tolist()
+    selected_chunk_id_rows = rpc_selected_chunk_ids[
+        :rows, :max_selected_chunks
+    ].tolist()
+
+    blocks_per_req: list[int] = []
+    chunks_per_req: list[int] = []
+    for row in range(rows):
+        candidate_n = min(
+            max(0, int(candidate_counts[row])),
+            max_candidates,
+        )
+        selected_chunk_n = min(
+            max(0, int(selected_chunk_len_rows[row])),
+            max_selected_chunks,
+        )
+        chunks_per_req.append(selected_chunk_n)
+
+        # Preserve the C++ bridge's behavior if duplicate chunk IDs ever appear:
+        # every matching candidate contributes its valid blocks.
+        chunk_block_counts: dict[int, int] = {}
+        for candidate_pos in range(candidate_n):
+            candidate_chunk_id = int(
+                candidate_chunk_rows[row][candidate_pos]
+            )
+            candidate_block_n = min(
+                max(
+                    0,
+                    int(candidate_block_len_rows[row][candidate_pos]),
+                ),
+                max_blocks_per_candidate,
+            )
+            valid_blocks = sum(
+                int(block_id) >= 0
+                for block_id in candidate_block_id_rows[row][candidate_pos][
+                    :candidate_block_n
+                ]
+            )
+            chunk_block_counts[candidate_chunk_id] = (
+                chunk_block_counts.get(candidate_chunk_id, 0) + valid_blocks
+            )
+
+        output_blocks = 0
+        for selected_pos in range(selected_chunk_n):
+            selected_chunk_id = int(selected_chunk_id_rows[row][selected_pos])
+            output_blocks += int(chunk_block_counts.get(selected_chunk_id, 0))
+            if output_blocks >= max_output_blocks:
+                output_blocks = max_output_blocks
+                break
+        blocks_per_req.append(output_blocks)
+
+    step_context["host_selected_blocks"] = int(sum(blocks_per_req))
+    step_context["host_selected_blocks_per_req"] = tuple(blocks_per_req)
+    step_context["host_selected_chunks"] = int(sum(chunks_per_req))
+    step_context["host_selected_chunks_per_req"] = tuple(chunks_per_req)
+    step_context["host_selected_blocks_source"] = "rpc_selected_chunks"
+
+
+def _aissd_host_selected_block_diagnostics_enabled(
+    step_context: dict[str, Any],
+) -> bool:
+    """Return whether an enabled diagnostic consumes the exact HOST count."""
+    return (
+        _sparse_kv_debug_enabled()
+        or _sparse_ctx_ptr_debug_enabled()
+        or _sparse_fa_replay_debug_enabled()
+        or _sparse_attention_diag_enabled()
+        or _sparse_attention_profile_enabled()
+        or _sparse_debug_counters_enabled()
+        or _aissd_selector_stats_enabled()
+        or _aissd_sparse_kv_e2e_stats_enabled(step_context)
+    )
 
 
 def _maybe_run_aissd_selector_op(
@@ -5080,7 +5261,11 @@ def _maybe_run_aissd_selector_op(
         "aissd_candidate_extent_count",
         "aissd_candidate_extent_lba",
         "aissd_candidate_extent_bytes",
+        "local_block_table",
+        "local_block_lens",
+        "local_token_lens",
         "fa_block_table",
+        "fa_block_lens",
         "fa_seq_lens",
         "aissd_rpc_selected_chunk_ids",
         "aissd_rpc_selected_chunk_lens",
@@ -5146,10 +5331,14 @@ def _maybe_run_aissd_selector_op(
         step_context["aissd_candidate_extent_count"],
         step_context["aissd_candidate_extent_lba"],
         step_context["aissd_candidate_extent_bytes"],
+        step_context["local_block_table"],
+        step_context["local_block_lens"],
+        step_context["local_token_lens"],
         step_context["selected_block_table"],
         step_context["selected_block_lens"],
         step_context["selected_ready_flags"],
         step_context["fa_block_table"],
+        step_context["fa_block_lens"],
         step_context["fa_seq_lens"],
         step_context["aissd_rpc_selected_chunk_ids"],
         step_context["aissd_rpc_selected_chunk_lens"],
@@ -5166,6 +5355,8 @@ def _maybe_run_aissd_selector_op(
         int(step_context.get("aissd_manifest_block_size", 4096)),
         int(step_context.get("aissd_timeout_ms", 300000)),
     )
+    if _aissd_host_selected_block_diagnostics_enabled(step_context):
+        _aissd_update_host_selected_block_diagnostics(step_context)
     if (
         _aissd_qk_calib_dump_enabled()
         and not _aissd_qk_calib_dense_baseline_enabled()
@@ -5866,12 +6057,11 @@ class SparseSSDAttentionImpl(AttentionImpl[AttentionMetadata]):
     ) -> tuple[bool, str]:
         """Return whether this step is safe to run through sparse FA-varlen.
 
-        FA-varlen sparse metadata is sized for decode-like sparse steps whose
-        number of query rows equals the number of active requests.  Prefill and
-        chunked-prefill can have thousands of query rows while no AISSD selector
-        result is available yet; those steps must use the normal dense
-        FlashAttention fallback.  This guard is intentionally placed before the
-        AISSD selector op, so prefill/warmup does not issue HOST<->SSD RPC.
+        The current sparse FA composition is decode-only.  CUDA-graph padding
+        means query.shape[0] can exceed active_reqs, so decode readiness is
+        carried explicitly by the connector instead of inferred from shape.
+        A suffix-prefill is routed to dense FA only when the connector confirms
+        that the complete LMCache prefix was restored first.
         """
         q_tokens = int(query.shape[0])
         try:
@@ -5880,11 +6070,18 @@ class SparseSSDAttentionImpl(AttentionImpl[AttentionMetadata]):
             host_active_reqs = 0
         if host_active_reqs <= 0:
             return False, f"no_active_sparse_requests(host_active_reqs={host_active_reqs})"
+        if not bool(step_context.get("host_local_metadata_ready", False)):
+            return False, "missing_local_suffix_block_metadata"
+        if not bool(step_context.get("host_sparse_decode_ready", False)):
+            return False, "suffix_or_chunked_prefill_requires_dense_attention"
 
         fa_block_table = step_context.get("fa_block_table")
+        fa_block_lens = step_context.get("fa_block_lens")
         fa_query_start_loc = step_context.get("fa_query_start_loc")
         if not isinstance(fa_block_table, torch.Tensor):
             return False, "missing_fa_block_table"
+        if not isinstance(fa_block_lens, torch.Tensor):
+            return False, "missing_fa_block_lens"
         if not isinstance(fa_query_start_loc, torch.Tensor):
             return False, "missing_fa_query_start_loc"
 
@@ -6021,12 +6218,15 @@ class SparseSSDAttentionImpl(AttentionImpl[AttentionMetadata]):
         if _sparse_kv_debug_enabled() and not torch.cuda.is_current_stream_capturing():
             logger.info(
                 "[sparse-attn-fa] route layer=%s q_shape=%s q_tokens=%d "
-                "host_reqs=%s selected_blocks=%s max_seq_len=%s generation=%s",
+                "host_reqs=%s selected_blocks=%s local_blocks=%s "
+                "local_tokens=%s max_seq_len=%s generation=%s",
                 layer_name,
                 tuple(query.shape),
                 q_tokens,
                 step_context.get("host_active_reqs"),
                 step_context.get("host_selected_blocks"),
+                step_context.get("host_local_blocks"),
+                step_context.get("host_local_tokens"),
                 sparse_meta.max_seq_len,
                 step_context.get("context_generation"),
             )
@@ -6113,11 +6313,38 @@ class SparseSSDAttentionImpl(AttentionImpl[AttentionMetadata]):
             _log_sparse_context_ptr("attn-before-op", layer_name, step_context)
             try:
                 impl = _sparse_attention_impl()
-                if impl in ("fa_varlen", "flash", "flash_attn", "flashattention"):
+                if impl in (
+                    "fa_varlen", "flash", "flash_attn", "flashattention",
+                    "custom", "cuda", "sparse_flash",
+                ):
                     can_route_fa, skip_reason = self._can_route_sparse_fa_varlen(
                         query, step_context
                     )
                     if not can_route_fa:
+                        host_active_reqs = int(
+                            step_context.get("host_active_reqs", 0) or 0
+                        )
+                        bootstrap = host_active_reqs <= 0
+                        safe_dense_prefill = bool(
+                            step_context.get("dense_fallback_safe", False)
+                        ) and not bool(
+                            step_context.get("host_sparse_decode_ready", False)
+                        )
+                        if not bootstrap and not safe_dense_prefill:
+                            raise RuntimeError(
+                                "Sparse FA-varlen refused an unsafe dense "
+                                "fallback for an active request: "
+                                f"layer={layer_name} q_shape={tuple(query.shape)} "
+                                f"generation={step_context.get('context_generation')} "
+                                f"reason={skip_reason} "
+                                f"dense_fallback_safe={step_context.get('dense_fallback_safe')} "
+                                f"local_metadata_ready={step_context.get('host_local_metadata_ready')} "
+                                f"decode_ready={step_context.get('host_sparse_decode_ready')}. "
+                                "Use AISSD_SPARSE_KV_PREFILL_POLICY=full_load "
+                                "for suffix prefill, or fix the missing decode "
+                                "metadata; the unloaded-prefix dense path is "
+                                "never permitted."
+                            )
                         if (
                             _sparse_attention_diag_enabled()
                             or _sparse_kv_debug_enabled()
@@ -6125,11 +6352,14 @@ class SparseSSDAttentionImpl(AttentionImpl[AttentionMetadata]):
                             logger.info(
                                 "[sparse-attn-fa] skip sparse FA-varlen route "
                                 "layer=%s q_shape=%s generation=%s reason=%s; "
-                                "falling back to FlashAttention",
+                                "dense_fallback_safe=%s bootstrap=%s; "
+                                "using dense FlashAttention",
                                 layer_name,
                                 tuple(query.shape),
                                 step_context.get("context_generation"),
                                 skip_reason,
+                                safe_dense_prefill,
+                                bootstrap,
                             )
                         return self._fallback_forward(
                             layer,
@@ -6231,8 +6461,9 @@ class SparseSSDAttentionImpl(AttentionImpl[AttentionMetadata]):
                     step_context["req_lmcache_cached_tokens"],
                     step_context["req_slot_lens"],
                     step_context["slot_mapping_table"],
-                    step_context["selected_block_table"],
-                    step_context["selected_block_lens"],
+                    step_context["fa_block_table"],
+                    step_context["fa_block_lens"],
+                    step_context["fa_seq_lens"],
                     step_context["selected_ready_flags"],
                     debug_counters,
                     int(step_context["block_size"]),
