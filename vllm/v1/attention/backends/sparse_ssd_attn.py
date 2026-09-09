@@ -440,6 +440,23 @@ def _aissd_selector_quality_oracle_store_full_curve() -> bool:
     return _env_flag("AISSD_SELECTOR_QUALITY_ORACLE_STORE_FULL_CURVE", "1")
 
 
+def _aissd_selector_quality_selector_mass_curve_enabled() -> bool:
+    """Whether to emit the mass curve induced by the selector-score ranking.
+
+    Unlike the Dense Oracle, this curve ranks candidates by the exact CPU
+    implementation of the configured SSD selector algorithm, then measures
+    the Dense-Oracle attention mass accumulated by that ranking.  It therefore
+    answers how much Top-N the current algorithm needs without changing the
+    production Top-N or issuing additional SSD/NPU requests.
+    """
+    return _env_flag("AISSD_SELECTOR_QUALITY_SELECTOR_MASS_CURVE", "1")
+
+
+def _aissd_selector_quality_selector_store_full_curve() -> bool:
+    """Store selector-ranked cumulative mass for every Top-N value."""
+    return _env_flag("AISSD_SELECTOR_QUALITY_SELECTOR_STORE_FULL_CURVE", "1")
+
+
 def _aissd_selector_quality_oracle_topn_points() -> list[int]:
     name = "AISSD_SELECTOR_QUALITY_ORACLE_MASS_TOPNS"
     raw = str(
@@ -603,6 +620,145 @@ def _aissd_selector_quality_oracle_mass_curve(
         # Element i is Oracle mass at Top-(i+1).  Candidate IDs are omitted to
         # keep the trace compact; the current production Top-N IDs remain in
         # the existing oracle_topn field.
+        result["full_cumulative_mass_normalized"] = cumulative_normalized
+    return result
+
+
+def _aissd_selector_quality_selector_mass_curve(
+    masses: list[float],
+    ranked_ids: list[int],
+    *,
+    current_top_n: int,
+    algorithm: str,
+    score_mode: str,
+) -> dict[str, Any]:
+    """Build cumulative Dense mass in same-algorithm selector-score order.
+
+    ``ranked_ids`` must be the complete deterministic ranking produced from
+    the CPU implementation of the configured SSD selector.  The mass values
+    are the same Dense-reference per-candidate values used by the Oracle curve,
+    so the two curves are directly comparable at every Top-N.
+    """
+    if not masses:
+        raise RuntimeError("selector-ranked mass curve has no candidates")
+
+    candidate_count = len(masses)
+    ranking = [int(candidate_id) for candidate_id in ranked_ids]
+    if len(ranking) != candidate_count or set(ranking) != set(
+        range(candidate_count)
+    ):
+        raise RuntimeError(
+            "selector-ranked mass curve requires a complete candidate "
+            f"permutation: ranking={len(ranking)} candidates={candidate_count}"
+        )
+
+    clean_masses: list[float] = []
+    for index, raw_mass in enumerate(masses):
+        value = float(raw_mass)
+        if not math.isfinite(value):
+            raise RuntimeError(
+                "selector-ranked Dense mass is not finite: "
+                f"candidate={index} value={value}"
+            )
+        if value < -1.0e-12:
+            raise RuntimeError(
+                "selector-ranked Dense mass is negative: "
+                f"candidate={index} value={value}"
+            )
+        clean_masses.append(max(0.0, value))
+
+    mass_sum = float(sum(clean_masses))
+    if not math.isfinite(mass_sum) or mass_sum <= 0.0:
+        raise RuntimeError(
+            f"selector-ranked candidate mass sum is invalid: {mass_sum}"
+        )
+
+    cumulative_mass: list[float] = []
+    running = 0.0
+    for candidate_id in ranking:
+        running += clean_masses[candidate_id]
+        cumulative_mass.append(float(running))
+    cumulative_normalized = [
+        float(value / mass_sum) for value in cumulative_mass
+    ]
+
+    requested_points = set(_aissd_selector_quality_oracle_topn_points())
+    requested_points.add(max(1, int(current_top_n)))
+    requested_points.add(candidate_count)
+    mass_at_topn: list[dict[str, Any]] = []
+    for requested_top_n in sorted(requested_points):
+        effective_top_n = min(int(requested_top_n), candidate_count)
+        mass = cumulative_mass[effective_top_n - 1]
+        mass_at_topn.append(
+            {
+                "requested_top_n": int(requested_top_n),
+                "effective_top_n": int(effective_top_n),
+                "clamped_to_candidate_count": bool(
+                    effective_top_n != int(requested_top_n)
+                ),
+                "mass": float(mass),
+                "normalized_mass": float(mass / mass_sum),
+            }
+        )
+
+    tolerance = max(1.0e-15, abs(mass_sum) * 1.0e-12)
+    n_by_target: list[dict[str, Any]] = []
+    for target in _aissd_selector_quality_oracle_mass_targets():
+        threshold = float(target) * mass_sum
+        min_top_n = candidate_count
+        for rank, value in enumerate(cumulative_mass, start=1):
+            if value + tolerance >= threshold:
+                min_top_n = rank
+                break
+        achieved_mass = cumulative_mass[min_top_n - 1]
+        n_by_target.append(
+            {
+                "target_mass": float(target),
+                "min_top_n": int(min_top_n),
+                "min_top_n_fraction": float(min_top_n / candidate_count),
+                "achieved_mass": float(achieved_mass),
+                "normalized_achieved_mass": float(achieved_mass / mass_sum),
+            }
+        )
+
+    n80_record = next(
+        item
+        for item in n_by_target
+        if abs(float(item["target_mass"]) - 0.8) < 1.0e-12
+    )
+    configured_top_n = min(max(1, int(current_top_n)), candidate_count)
+    result: dict[str, Any] = {
+        "schema_version": 1,
+        "curve_kind": "same_algorithm_cpu_selector_ranking",
+        "ranking_source": "cpu_chunk_scores",
+        "algorithm": str(algorithm),
+        "score_mode": str(score_mode),
+        "scope": "lmcache_ssd_candidate_pool",
+        "normalization": "candidate_mass_sum",
+        "candidate_count": int(candidate_count),
+        "candidate_mass_sum": float(mass_sum),
+        "current_top_n": int(current_top_n),
+        "current_effective_top_n": int(configured_top_n),
+        "current_top_n_mass": float(cumulative_mass[configured_top_n - 1]),
+        "current_top_n_normalized_mass": float(
+            cumulative_normalized[configured_top_n - 1]
+        ),
+        "mass_at_topn": mass_at_topn,
+        "n_by_target": n_by_target,
+        "n80": int(n80_record["min_top_n"]),
+        "n80_fraction": float(n80_record["min_top_n_fraction"]),
+        "n80_achieved_mass": float(n80_record["achieved_mass"]),
+        "n80_normalized_achieved_mass": float(
+            n80_record["normalized_achieved_mass"]
+        ),
+        "full_curve_stored": bool(
+            _aissd_selector_quality_selector_store_full_curve()
+        ),
+    }
+    if result["full_curve_stored"]:
+        # Element i is Dense-reference mass captured by the first i+1 chunks
+        # in selector-score order.  Candidate IDs and all raw selector scores
+        # remain optional to keep normal traces compact.
         result["full_cumulative_mass_normalized"] = cumulative_normalized
     return result
 
@@ -2347,6 +2503,7 @@ def _aissd_selector_quality_same_algorithm(
     ssd_selected: list[int],
     candidates: list[dict[str, Any]],
     *,
+    dense_masses: list[float] | None = None,
     top_n: int,
     top_m: int,
     score_mode_code: int,
@@ -2527,6 +2684,28 @@ def _aissd_selector_quality_same_algorithm(
         "cpu_chunk_score_max": float(max(cpu_scores)),
         "cpu_chunk_score_mean": float(sum(cpu_scores) / len(cpu_scores)),
     }
+    if (
+        dense_masses is not None
+        and _aissd_selector_quality_selector_mass_curve_enabled()
+    ):
+        if len(dense_masses) < candidate_count:
+            raise RuntimeError(
+                "selector-ranked mass curve has fewer Dense masses than "
+                f"selector candidates: masses={len(dense_masses)} "
+                f"candidates={candidate_count}"
+            )
+        selector_curve = _aissd_selector_quality_selector_mass_curve(
+            [float(value) for value in dense_masses[:candidate_count]],
+            [int(candidate_id) for candidate_id in ranking],
+            current_top_n=int(top_n),
+            algorithm=algo,
+            score_mode=score_mode,
+        )
+        result["selector_mass_curve"] = selector_curve
+        result["selector_n80"] = int(selector_curve["n80"])
+        result["selector_n80_fraction"] = float(
+            selector_curve["n80_fraction"]
+        )
     if store_all_scores is None:
         store_all_scores = _env_flag(
             "AISSD_SELECTOR_QUALITY_SAME_ALGO_STORE_ALL_SCORES", "0"
@@ -3428,6 +3607,7 @@ def _aissd_maybe_trace_selector_quality(
                     score_chunks,
                     ssd_selected,
                     candidates,
+                    dense_masses=masses,
                     top_n=int(top_n),
                     top_m=int(top_m),
                     score_mode_code=int(score_mode_code),
@@ -3473,7 +3653,7 @@ def _aissd_maybe_trace_selector_quality(
             )
         elapsed_ms = (time.perf_counter() - t0) * 1000.0
         record = {
-            "schema_version": 6,
+            "schema_version": 7,
             "tag": trace_tag,
             "req_id": req_id,
             "request_ordinal": int(req_ordinal),
@@ -3516,6 +3696,16 @@ def _aissd_maybe_trace_selector_quality(
             record["oracle_n80"] = int(primary_oracle_curve["n80"])
             record["oracle_n80_fraction"] = float(
                 primary_oracle_curve["n80_fraction"]
+            )
+        primary_selector_curve = (
+            same_algorithm_primary.get("selector_mass_curve")
+            if isinstance(same_algorithm_primary, dict)
+            else None
+        )
+        if isinstance(primary_selector_curve, dict):
+            record["selector_n80"] = int(primary_selector_curve["n80"])
+            record["selector_n80_fraction"] = float(
+                primary_selector_curve["n80_fraction"]
             )
         if isinstance(k_layout_trace, dict):
             record["k_layout_trace"] = k_layout_trace
