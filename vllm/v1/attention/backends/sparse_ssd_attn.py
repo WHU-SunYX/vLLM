@@ -318,6 +318,16 @@ _AISSD_SELECTOR_QUALITY_REQ_ORDER: dict[str, int] = {}
 _AISSD_SELECTOR_QUALITY_REQ_GENERATIONS: dict[str, dict[tuple[int, int], int]] = {}
 _AISSD_SELECTOR_QUALITY_WARNED = False
 
+# Q-drift shadow calibration deliberately keeps the real attention path on a
+# freshly selected Top-N for every token.  The retained history is used only to
+# answer the counterfactual question: "what would have happened if the Top-N
+# selected at an older anchor token had been reused here?"  Keeping this state
+# separate from aissd_selected_metadata_cache is important; otherwise enabling
+# calibration would change the live q_drift anchor/refresh state or the
+# selected metadata consumed by attention.
+_AISSD_Q_DRIFT_SHADOW_LOCK = threading.Lock()
+_AISSD_Q_DRIFT_SHADOW_SESSION_ID = f"pid{os.getpid()}-ns{time.time_ns()}"
+
 # Real Q/K calibration capture for the external NPU compiler.  This is
 # intentionally independent of Phase-1 selector-quality tracing: calibration
 # runs can dump representative model inputs without also paying the dense-oracle
@@ -3435,7 +3445,11 @@ def _aissd_maybe_trace_selector_quality(
     if not _AISSD_SELECTOR_QUALITY_WARNED:
         layer_reuse = _aissd_layer_reuse_enabled()
         token_reuse = _aissd_token_reuse_strategy()
-        if layer_reuse or token_reuse not in ("none", "off", "disabled"):
+        token_reuse_changes_attention = (
+            token_reuse not in ("none", "off", "disabled")
+            and not _aissd_q_drift_shadow_enabled()
+        )
+        if layer_reuse or token_reuse_changes_attention:
             logger.warning(
                 "[aissd-selector-quality] Phase-1 isolation is intended for "
                 "AISSD_SPARSE_KV_LAYER_REUSE=0 and AISSD_TOKEN_REUSE_STRATEGY=none; "
@@ -3966,6 +3980,39 @@ def _aissd_q_drift_max_staleness() -> int:
     return max(1, int(value))
 
 
+def _aissd_q_drift_shadow_enabled() -> bool:
+    """Whether to run fresh selection while tracing hypothetical Q reuse.
+
+    This is a calibration-only switch.  It is disabled by default and is
+    intentionally independent of AISSD_TOKEN_REUSE_OVERHEAD_LOG: the latter
+    controls human-readable timing/distribution logs, while this switch emits
+    machine-readable counterfactual Top-N records.
+    """
+    return _env_flag("AISSD_TOKEN_REUSE_Q_DRIFT_SHADOW", "0")
+
+
+def _aissd_q_drift_shadow_strict() -> bool:
+    return _env_flag("AISSD_TOKEN_REUSE_Q_DRIFT_SHADOW_STRICT", "1")
+
+
+def _aissd_q_drift_shadow_max_age() -> int:
+    # Store comparisons far enough back to simulate several max-staleness
+    # choices offline without rerunning the expensive SSD selector workload.
+    return max(
+        1,
+        _aissd_env_int("AISSD_TOKEN_REUSE_Q_DRIFT_SHADOW_MAX_AGE", 8),
+    )
+
+
+def _aissd_q_drift_shadow_trace_path() -> str:
+    return str(
+        os.environ.get(
+            "AISSD_TOKEN_REUSE_Q_DRIFT_SHADOW_PATH",
+            "/tmp/aissd_q_drift_shadow.jsonl",
+        )
+    ).strip()
+
+
 def _aissd_token_reuse_overhead_log_enabled() -> bool:
     return _env_flag("AISSD_TOKEN_REUSE_OVERHEAD_LOG", "0")
 
@@ -4160,6 +4207,333 @@ def _aissd_compute_q_drift(
     if any(not (value == value) for value in values):
         return float("inf"), float("inf"), float("inf"), float("inf"), distribution
     return decision_cos, decision_rel_l2, max_cos, max_rel_l2, distribution
+
+
+def _aissd_q_drift_shadow_selected_rows(
+    selected_ids: Any,
+    selected_lens: Any,
+    active_reqs: int,
+) -> list[list[int]]:
+    """Snapshot exact SSD RPC chunk IDs as one ordered Top-N row per request."""
+    if not isinstance(selected_ids, torch.Tensor) or not isinstance(
+        selected_lens, torch.Tensor
+    ):
+        raise RuntimeError("q_drift shadow trace is missing RPC selected chunk tensors")
+    if selected_ids.dim() != 2 or selected_lens.dim() != 1:
+        raise RuntimeError(
+            "q_drift shadow RPC selected chunk tensors have invalid shapes: "
+            f"ids={tuple(selected_ids.shape)} lens={tuple(selected_lens.shape)}"
+        )
+    ids = selected_ids.detach()
+    lens = selected_lens.detach()
+    if ids.is_cuda:
+        ids = ids.cpu()
+    if lens.is_cuda:
+        lens = lens.cpu()
+    rows = min(
+        max(0, int(active_reqs)),
+        int(ids.shape[0]),
+        int(lens.shape[0]),
+    )
+    capacity = int(ids.shape[1])
+    result: list[list[int]] = []
+    for row in range(rows):
+        count = min(max(0, int(lens[row].item())), capacity)
+        result.append(
+            [
+                int(value)
+                for value in ids[row, :count].tolist()
+                if int(value) >= 0
+            ]
+        )
+    return result
+
+
+def _aissd_q_drift_shadow_topn_metrics(
+    reused_topn: list[int],
+    fresh_topn: list[int],
+) -> dict[str, Any]:
+    """Compare a hypothetical reused ordered Top-N with the fresh selector."""
+    reused = [int(value) for value in reused_topn if int(value) >= 0]
+    fresh = [int(value) for value in fresh_topn if int(value) >= 0]
+    reused_set = set(reused)
+    fresh_set = set(fresh)
+    overlap = len(reused_set.intersection(fresh_set))
+    union = len(reused_set.union(fresh_set))
+    prefix = 0
+    for cached_id, fresh_id in zip(reused, fresh):
+        if cached_id != fresh_id:
+            break
+        prefix += 1
+    denominator = len(fresh)
+    return {
+        "reused_count": int(len(reused)),
+        "fresh_count": int(len(fresh)),
+        "overlap_count": int(overlap),
+        "topn_recall": (
+            float(overlap) / float(denominator) if denominator > 0 else 0.0
+        ),
+        "jaccard": float(overlap) / float(union) if union > 0 else 1.0,
+        "exact_set_match": bool(reused_set == fresh_set),
+        "exact_order_match": bool(reused == fresh),
+        "prefix_match_count": int(prefix),
+        "zero_overlap": bool(overlap == 0 and denominator > 0),
+        "reused_only": sorted(int(value) for value in reused_set - fresh_set),
+        "fresh_only": sorted(int(value) for value in fresh_set - reused_set),
+    }
+
+
+def _aissd_q_drift_shadow_history(
+    step_context: dict[str, Any],
+) -> dict[int, dict[str, Any]]:
+    history = step_context.get("aissd_q_drift_shadow_history")
+    if not isinstance(history, dict):
+        history = {}
+        step_context["aissd_q_drift_shadow_history"] = history
+    return history
+
+
+def _aissd_q_drift_shadow_prepare(
+    *,
+    step_context: dict[str, Any],
+    current_q: torch.Tensor,
+    candidate_signature: tuple[int, ...],
+    token_state: dict[str, Any],
+    generation: int,
+    layer_id: int,
+    layer_name: str,
+) -> dict[str, Any]:
+    """Build threshold-independent comparisons against recent fresh anchors.
+
+    No live selected metadata is restored here.  Every token continues to the
+    real selector, so calibration cannot change the Top-N consumed by sparse
+    attention.  Comparing against every retained age makes one trace reusable
+    for offline sweeps of both thresholds and max-staleness.
+    """
+    t0 = time.perf_counter()
+    active_sig = tuple(token_state.get("active_sig", ()))
+    token_step = int(token_state["token_step"])
+    max_age = _aissd_q_drift_shadow_max_age()
+    history_by_layer = _aissd_q_drift_shadow_history(step_context)
+    state = history_by_layer.get(int(layer_id))
+    if (
+        not isinstance(state, dict)
+        or int(state.get("generation", -999999)) != int(generation)
+        or tuple(state.get("active_sig", ())) != active_sig
+    ):
+        state = {
+            "generation": int(generation),
+            "active_sig": active_sig,
+            "items": [],
+        }
+        history_by_layer[int(layer_id)] = state
+
+    items = state.get("items")
+    if not isinstance(items, list):
+        items = []
+        state["items"] = items
+
+    comparisons: list[dict[str, Any]] = []
+    for anchor in reversed(items):
+        if not isinstance(anchor, dict):
+            continue
+        anchor_step = int(anchor.get("token_step", -999999))
+        age = token_step - anchor_step
+        if age <= 0:
+            continue
+        if age > max_age:
+            break
+        anchor_q = anchor.get("q")
+        shape_same = isinstance(anchor_q, torch.Tensor) and tuple(
+            anchor_q.shape
+        ) == tuple(current_q.shape)
+        anchor_signature = tuple(anchor.get("candidate_signature", ()))
+        candidate_same = bool(anchor_signature) and (
+            anchor_signature == tuple(candidate_signature)
+        )
+        comparison: dict[str, Any] = {
+            "anchor_token_step": int(anchor_step),
+            "anchor_age": int(age),
+            "candidate_same": bool(candidate_same),
+            "q_shape_same": bool(shape_same),
+            "anchor_fresh_topn_by_req": copy.deepcopy(
+                anchor.get("fresh_topn_by_req", [])
+            ),
+        }
+        if shape_same:
+            (
+                cos_decision,
+                rel_l2_decision,
+                cos_max,
+                rel_l2_max,
+                distribution,
+            ) = _aissd_compute_q_drift(
+                current_q,
+                anchor_q,
+                collect_distribution=True,
+            )
+            comparison.update(
+                {
+                    "cos_decision": float(cos_decision),
+                    "rel_l2_decision": float(rel_l2_decision),
+                    "cos_max": float(cos_max),
+                    "rel_l2_max": float(rel_l2_max),
+                    "distribution": distribution,
+                    "configured_threshold_pass": bool(
+                        candidate_same
+                        and cos_decision <= _aissd_q_drift_cos_threshold()
+                        and rel_l2_decision
+                        <= _aissd_q_drift_rel_l2_threshold()
+                    ),
+                }
+            )
+        else:
+            comparison.update(
+                {
+                    "cos_decision": None,
+                    "rel_l2_decision": None,
+                    "cos_max": None,
+                    "rel_l2_max": None,
+                    "distribution": None,
+                    "configured_threshold_pass": False,
+                }
+            )
+        comparisons.append(comparison)
+
+    comparisons.sort(key=lambda item: int(item["anchor_age"]))
+    return {
+        "schema_version": 1,
+        "trace_kind": "q_drift_shadow_fresh_selector",
+        "session_id": _AISSD_Q_DRIFT_SHADOW_SESSION_ID,
+        "generation": int(generation),
+        "token_step": int(token_step),
+        "layer_id": int(layer_id),
+        "layer_name": str(layer_name),
+        "active_sig": list(active_sig),
+        "candidate_signature": [int(value) for value in candidate_signature],
+        "decision_reduce": _aissd_q_drift_reduce(),
+        "configured_cos_threshold": float(_aissd_q_drift_cos_threshold()),
+        "configured_rel_l2_threshold": float(
+            _aissd_q_drift_rel_l2_threshold()
+        ),
+        "configured_max_staleness": int(_aissd_q_drift_max_staleness()),
+        "shadow_max_age": int(max_age),
+        "comparisons": comparisons,
+        "current_q": current_q,
+        "history_state": state,
+        "prepare_ms": float((time.perf_counter() - t0) * 1000.0),
+    }
+
+
+def _aissd_q_drift_shadow_append_json(record: dict[str, Any]) -> None:
+    path = _aissd_q_drift_shadow_trace_path()
+    if not path:
+        return
+    parent = os.path.dirname(path)
+    if parent:
+        os.makedirs(parent, exist_ok=True)
+    line = json.dumps(record, sort_keys=True, separators=(",", ":"))
+    with _AISSD_Q_DRIFT_SHADOW_LOCK:
+        with open(path, "a", encoding="utf-8") as stream:
+            stream.write(line + "\n")
+
+
+def _aissd_q_drift_shadow_finalize(
+    *,
+    step_context: dict[str, Any],
+    plan: dict[str, Any],
+) -> None:
+    """Attach the fresh SSD Top-N, emit one record, and advance history."""
+    finalize_t0 = time.perf_counter()
+    active_reqs = len(plan.get("active_sig", []))
+    fresh_topn = _aissd_q_drift_shadow_selected_rows(
+        step_context.get("aissd_rpc_selected_chunk_ids"),
+        step_context.get("aissd_rpc_selected_chunk_lens"),
+        active_reqs,
+    )
+    comparisons = plan.get("comparisons", [])
+    if not isinstance(comparisons, list):
+        comparisons = []
+
+    for comparison in comparisons:
+        anchor_topn = comparison.get("anchor_fresh_topn_by_req", [])
+        metrics_by_req: list[dict[str, Any]] = []
+        if (
+            bool(comparison.get("candidate_same", False))
+            and isinstance(anchor_topn, list)
+            and len(anchor_topn) == len(fresh_topn)
+        ):
+            for request_index, (cached_row, fresh_row) in enumerate(
+                zip(anchor_topn, fresh_topn)
+            ):
+                metrics = _aissd_q_drift_shadow_topn_metrics(
+                    list(cached_row), list(fresh_row)
+                )
+                metrics["request_index"] = int(request_index)
+                metrics["req_id"] = str(plan["active_sig"][request_index])
+                metrics_by_req.append(metrics)
+        comparison["topn_metrics_by_req"] = metrics_by_req
+        if metrics_by_req:
+            recalls = [float(item["topn_recall"]) for item in metrics_by_req]
+            comparison["topn_summary"] = {
+                "request_count": int(len(metrics_by_req)),
+                "mean_recall": float(sum(recalls) / len(recalls)),
+                "min_recall": float(min(recalls)),
+                "exact_set_rate": float(
+                    sum(bool(item["exact_set_match"]) for item in metrics_by_req)
+                    / len(metrics_by_req)
+                ),
+                "exact_order_rate": float(
+                    sum(bool(item["exact_order_match"]) for item in metrics_by_req)
+                    / len(metrics_by_req)
+                ),
+                "zero_overlap_count": int(
+                    sum(bool(item["zero_overlap"]) for item in metrics_by_req)
+                ),
+            }
+        else:
+            comparison["topn_summary"] = None
+
+    record = {
+        key: value
+        for key, value in plan.items()
+        if key not in ("current_q", "history_state")
+    }
+    record["fresh_topn_by_req"] = fresh_topn
+    record["finalize_ms_before_write"] = float(
+        (time.perf_counter() - finalize_t0) * 1000.0
+    )
+    record["trace_elapsed_ms_before_write"] = float(
+        float(record.get("prepare_ms", 0.0))
+        + float(record["finalize_ms_before_write"])
+    )
+    _aissd_q_drift_shadow_append_json(record)
+
+    state = plan.get("history_state")
+    current_q = plan.get("current_q")
+    if not isinstance(state, dict) or not isinstance(current_q, torch.Tensor):
+        raise RuntimeError("q_drift shadow history state was lost before finalize")
+    items = state.get("items")
+    if not isinstance(items, list):
+        items = []
+        state["items"] = items
+    current_step = int(plan["token_step"])
+    items[:] = [
+        item
+        for item in items
+        if isinstance(item, dict)
+        and int(item.get("token_step", -999999)) != current_step
+        and 0 < current_step - int(item.get("token_step", -999999))
+        <= _aissd_q_drift_shadow_max_age()
+    ]
+    items.append(
+        {
+            "token_step": int(current_step),
+            "q": current_q.detach().clone(),
+            "candidate_signature": tuple(plan["candidate_signature"]),
+            "fresh_topn_by_req": copy.deepcopy(fresh_topn),
+        }
+    )
 
 
 def _aissd_q_drift_log_value(value: Any) -> str:
@@ -5070,6 +5444,33 @@ def _maybe_run_aissd_selector_op(
     cross_token_reuse_enabled = _aissd_cross_token_reuse_enabled(
         token_reuse_strategy
     )
+    q_drift_shadow_enabled = _aissd_q_drift_shadow_enabled()
+    q_drift_shadow_plan: dict[str, Any] | None = None
+    if q_drift_shadow_enabled:
+        if not _aissd_token_reuse_is_q_drift(token_reuse_strategy):
+            raise RuntimeError(
+                "AISSD_TOKEN_REUSE_Q_DRIFT_SHADOW=1 requires "
+                "AISSD_TOKEN_REUSE_STRATEGY=q_drift"
+            )
+        if layer_reuse_enabled:
+            raise RuntimeError(
+                "AISSD_TOKEN_REUSE_Q_DRIFT_SHADOW=1 currently requires "
+                "AISSD_SPARSE_KV_LAYER_REUSE=0. Shadow calibration must run "
+                "a fresh selector independently at every layer/token."
+            )
+        if _aissd_qk_calib_dense_baseline_enabled():
+            raise RuntimeError(
+                "AISSD_TOKEN_REUSE_Q_DRIFT_SHADOW=1 is incompatible with "
+                "AISSD_QK_CALIB_DENSE_BASELINE=1 because dense-baseline mode "
+                "intentionally skips the SSD selector RPC"
+            )
+        logger.info_once(
+            "[aissd-q-drift-shadow] calibration active: every token runs a "
+            "fresh selector for real attention; reuse is evaluated only in "
+            "the JSONL trace path=%s max_age=%s",
+            _aissd_q_drift_shadow_trace_path(),
+            _aissd_q_drift_shadow_max_age(),
+        )
     if (
         _aissd_token_reuse_is_q_drift(token_reuse_strategy)
         and layer_reuse_enabled
@@ -5297,20 +5698,47 @@ def _maybe_run_aissd_selector_op(
                     )
 
             restore_t0 = time.perf_counter()
-            restored = _aissd_restore_selected_metadata(
-                step_context,
-                int(layer_id),
-                generation,
-                token_state,
-                token_reuse_strategy,
-                current_q=q_drift_query,
-                candidate_signature=candidate_signature,
-                evaluate_q_drift=_aissd_token_reuse_is_q_drift(
-                    token_reuse_strategy
-                ),
-            )
+            if q_drift_shadow_enabled:
+                if q_drift_query is None:
+                    raise RuntimeError(
+                        "AISSD q_drift shadow trace could not obtain current Q"
+                    )
+                q_drift_shadow_plan = _aissd_q_drift_shadow_prepare(
+                    step_context=step_context,
+                    current_q=q_drift_query,
+                    candidate_signature=candidate_signature,
+                    token_state=token_state,
+                    generation=generation,
+                    layer_id=layer_id,
+                    layer_name=layer_name,
+                )
+                # Never restore cached selected metadata in calibration mode.
+                # The real attention path below must consume the fresh selector
+                # output so threshold sweeps cannot change model predictions.
+                restored = False
+                step_context[
+                    "aissd_token_reuse_last_reason"
+                ] = "q_drift_shadow_fresh_selector"
+                step_context["aissd_q_drift_check_ms"] = 0.0
+                step_context["aissd_q_drift_distribution"] = None
+            else:
+                restored = _aissd_restore_selected_metadata(
+                    step_context,
+                    int(layer_id),
+                    generation,
+                    token_state,
+                    token_reuse_strategy,
+                    current_q=q_drift_query,
+                    candidate_signature=candidate_signature,
+                    evaluate_q_drift=_aissd_token_reuse_is_q_drift(
+                        token_reuse_strategy
+                    ),
+                )
             restore_ms = (time.perf_counter() - restore_t0) * 1000.0
-            if _aissd_token_reuse_is_q_drift(token_reuse_strategy):
+            if (
+                _aissd_token_reuse_is_q_drift(token_reuse_strategy)
+                and not q_drift_shadow_enabled
+            ):
                 _aissd_log_q_drift_decision(
                     step_context=step_context,
                     layer_name=layer_name,
@@ -5514,6 +5942,21 @@ def _maybe_run_aissd_selector_op(
         int(step_context.get("aissd_manifest_block_size", 4096)),
         int(step_context.get("aissd_timeout_ms", 300000)),
     )
+    if q_drift_shadow_plan is not None:
+        try:
+            _aissd_q_drift_shadow_finalize(
+                step_context=step_context,
+                plan=q_drift_shadow_plan,
+            )
+        except Exception as exc:
+            if _aissd_q_drift_shadow_strict():
+                raise
+            logger.warning(
+                "[aissd-q-drift-shadow] trace failed layer=%s error=%s",
+                layer_name,
+                exc,
+                exc_info=True,
+            )
     if _aissd_host_selected_block_diagnostics_enabled(step_context):
         _aissd_update_host_selected_block_diagnostics(step_context)
     if (
@@ -5565,7 +6008,9 @@ def _maybe_run_aissd_selector_op(
         layer_reuse_enabled and layer_reuse_strategy == "static"
     )
     cache_for_independent_token_reuse = (
-        not layer_reuse_enabled and cross_token_reuse_enabled
+        not layer_reuse_enabled
+        and cross_token_reuse_enabled
+        and not q_drift_shadow_enabled
     )
     if cache_for_static_layer_reuse or cache_for_independent_token_reuse:
         cache_t0 = time.perf_counter()
@@ -5606,7 +6051,11 @@ def _maybe_run_aissd_selector_op(
     step_context["aissd_selector_reuse_source_layer_id"] = int(layer_id)
     step_context["aissd_selector_token_reuse_strategy"] = token_reuse_strategy
     step_context["aissd_selector_token_step"] = int(token_state["token_step"])
-    step_context["aissd_selector_token_reuse_reason"] = "selector_refreshed"
+    step_context["aissd_selector_token_reuse_reason"] = (
+        "q_drift_shadow_fresh_selector"
+        if q_drift_shadow_enabled
+        else "selector_refreshed"
+    )
     if layer_reuse_enabled and layer_reuse_strategy == "static":
         step_context["aissd_selector_f_layers"] = _aissd_effective_f_layers(
             step_context
