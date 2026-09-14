@@ -3885,6 +3885,35 @@ def _aissd_token_reuse_is_q_drift(strategy: str | None = None) -> bool:
     return strategy in ("q_drift", "q-drift", "qdrift")
 
 
+def _aissd_cross_token_reuse_enabled(strategy: str | None = None) -> bool:
+    """Return whether selected metadata may be reused by a later token.
+
+    Token reuse is orthogonal to layer reuse.  With layer reuse disabled every
+    model layer owns an independent cache entry, keyed by that layer id.  With
+    static layer reuse enabled only F layers own such entries and S layers
+    consume the already-resolved F-layer entry for the current token.
+
+    ``none``/``every_token`` deliberately run a selector for every token.  Keep
+    unknown names disabled instead of accidentally turning a typo into a
+    long-lived reuse policy.
+    """
+    if strategy is None:
+        strategy = _aissd_token_reuse_strategy()
+    return strategy in (
+        "legacy",
+        "long",
+        "long_reuse",
+        "fixed_interval",
+        "interval",
+        "hybrid",
+        "q_drift",
+        "q-drift",
+        "qdrift",
+        "always",
+        "force",
+    )
+
+
 def _aissd_token_reuse_interval() -> int:
     return max(1, _aissd_env_int("AISSD_TOKEN_REUSE_INTERVAL", 1))
 
@@ -4151,7 +4180,8 @@ def _aissd_log_q_drift_decision(
     restored: bool,
 ) -> None:
     # Reuse the existing token-reuse diagnostics switch; do not introduce a
-    # second Q-drift-specific log switch. This emits only for F layers.
+    # second Q-drift-specific log switch. With static layer reuse this emits
+    # only for F layers; with layer reuse disabled every layer is independent.
     if not _aissd_token_reuse_overhead_log_enabled():
         return
 
@@ -5037,13 +5067,19 @@ def _maybe_run_aissd_selector_op(
     layer_id = _aissd_parse_layer_id(layer_name, step_context)
     layer_reuse_enabled = _aissd_layer_reuse_enabled()
     layer_reuse_strategy = _aissd_layer_reuse_strategy()
-    if _aissd_token_reuse_is_q_drift(token_reuse_strategy) and (
-        not layer_reuse_enabled or layer_reuse_strategy != "static"
+    cross_token_reuse_enabled = _aissd_cross_token_reuse_enabled(
+        token_reuse_strategy
+    )
+    if (
+        _aissd_token_reuse_is_q_drift(token_reuse_strategy)
+        and layer_reuse_enabled
+        and layer_reuse_strategy != "static"
     ):
         raise RuntimeError(
-            "AISSD_TOKEN_REUSE_STRATEGY=q_drift currently requires "
-            "AISSD_SPARSE_KV_LAYER_REUSE=1 and "
-            "AISSD_LAYER_REUSE_STRATEGY=static"
+            "AISSD_TOKEN_REUSE_STRATEGY=q_drift supports either independent "
+            "per-layer token reuse (AISSD_SPARSE_KV_LAYER_REUSE=0) or static "
+            "F/S layer reuse (AISSD_SPARSE_KV_LAYER_REUSE=1 and "
+            "AISSD_LAYER_REUSE_STRATEGY=static)"
         )
 
     token_state_t0 = time.perf_counter()
@@ -5222,13 +5258,136 @@ def _maybe_run_aissd_selector_op(
             return 0.0
     else:
         # AISSD_SPARSE_KV_LAYER_REUSE=0 is the hard off switch for layer reuse.
-        # In this mode each attention layer must run its own selector using that
-        # layer's prepared candidate/qkpack metadata.  Do not fall back to the
-        # legacy non-layered aliases, because those aliases point at candidate
-        # layer position 0 in the layered step context.
+        # Every attention layer owns independent candidate metadata and an
+        # independent cross-token selected-metadata cache entry.  This keeps
+        # token reuse orthogonal to F/S layer reuse: layer L may reuse only a
+        # previous token's result from layer L, never another layer's result.
+        # Do not fall back to the legacy non-layered aliases, because those
+        # aliases point at candidate layer position 0 in the layered context.
         _aissd_select_candidate_tensors_for_layer(step_context, layer_id)
         step_context["aissd_selector_reuse_strategy"] = "none"
         step_context["aissd_selector_reuse_source_layer_id"] = int(layer_id)
+
+        if cross_token_reuse_enabled:
+            if _aissd_token_reuse_is_q_drift(token_reuse_strategy):
+                candidate_signature = _aissd_current_candidate_signature(
+                    step_context
+                )
+                q_drift_query = _aissd_q_drift_query_view(
+                    query,
+                    host_active_reqs,
+                    int(num_heads),
+                    int(head_size),
+                )
+                if q_drift_query is None:
+                    raise RuntimeError(
+                        "AISSD q_drift could not reshape the current layer Q to "
+                        "[active_reqs, num_heads, head_size] while layer reuse "
+                        f"is disabled: layer={layer_name} "
+                        f"q_shape={tuple(query.shape)} "
+                        f"active_reqs={host_active_reqs} "
+                        f"num_heads={num_heads} head_size={head_size}"
+                    )
+                if not candidate_signature:
+                    raise RuntimeError(
+                        "AISSD q_drift requires per-layer candidate signatures "
+                        "from prepare_sparse_kv_step() while layer reuse is "
+                        f"disabled; update vllm_v1_adapter.py and verify "
+                        f"layer={layer_name}"
+                    )
+
+            restore_t0 = time.perf_counter()
+            restored = _aissd_restore_selected_metadata(
+                step_context,
+                int(layer_id),
+                generation,
+                token_state,
+                token_reuse_strategy,
+                current_q=q_drift_query,
+                candidate_signature=candidate_signature,
+                evaluate_q_drift=_aissd_token_reuse_is_q_drift(
+                    token_reuse_strategy
+                ),
+            )
+            restore_ms = (time.perf_counter() - restore_t0) * 1000.0
+            if _aissd_token_reuse_is_q_drift(token_reuse_strategy):
+                _aissd_log_q_drift_decision(
+                    step_context=step_context,
+                    layer_name=layer_name,
+                    layer_id=layer_id,
+                    token_state=token_state,
+                    restored=restored,
+                )
+            if overhead_log_enabled:
+                logger.info(
+                    "[aissd-token-reuse-overhead] op=restore layer=%s "
+                    "layer_id=%s generation=%s strategy=%s "
+                    "layer_reuse=0 source_layer_id=%s hit=%s "
+                    "state_ms=%.6f restore_ms=%.6f copy_count=%s "
+                    "copy_bytes=%s skip_active=%s token_step=%s "
+                    "cached_token_step=%s reason=%s q_drift_check_ms=%s",
+                    layer_name,
+                    layer_id,
+                    generation,
+                    token_reuse_strategy,
+                    layer_id,
+                    restored,
+                    token_state_ms,
+                    restore_ms,
+                    step_context.get(
+                        "aissd_token_reuse_restore_copy_count", 0
+                    ),
+                    step_context.get(
+                        "aissd_token_reuse_restore_copy_bytes", 0
+                    ),
+                    step_context.get(
+                        "aissd_token_reuse_restore_skip_active", False
+                    ),
+                    token_state.get("token_step"),
+                    step_context.get("aissd_token_reuse_cached_token_step"),
+                    step_context.get("aissd_token_reuse_last_reason"),
+                    step_context.get("aissd_q_drift_check_ms", 0.0),
+                )
+            if restored:
+                if _aissd_selector_stats_enabled() or _sparse_kv_debug_enabled():
+                    logger.info(
+                        "[aissd-selector-op] reuse layer=%s layer_id=%s "
+                        "generation=%s strategy=token source_layer_id=%s "
+                        "token_reuse_strategy=%s token_step=%s "
+                        "cached_token_step=%s token_reuse_reason=%s",
+                        layer_name,
+                        layer_id,
+                        generation,
+                        layer_id,
+                        token_reuse_strategy,
+                        token_state.get("token_step"),
+                        step_context.get(
+                            "aissd_token_reuse_cached_token_step"
+                        ),
+                        step_context.get("aissd_token_reuse_last_reason"),
+                    )
+                step_context["aissd_selector_ms"] = 0.0
+                step_context["aissd_selector_reused"] = True
+                step_context["aissd_selector_reuse_strategy"] = "token"
+                step_context[
+                    "aissd_selector_token_reuse_strategy"
+                ] = token_reuse_strategy
+                step_context["aissd_selector_token_step"] = int(
+                    token_state["token_step"]
+                )
+                step_context[
+                    "aissd_selector_token_reuse_reason"
+                ] = step_context.get("aissd_token_reuse_last_reason")
+                step_context["aissd_selector_reuse_source_layer_id"] = int(
+                    layer_id
+                )
+                step_context["aissd_selector_real_layer"] = step_context.get(
+                    "aissd_selected_metadata_active_layer_name", layer_name
+                )
+                step_context["aissd_selector_real_layer_id"] = int(layer_id)
+                step_context["aissd_selector_f_layers"] = ()
+                return 0.0
+
         if _aissd_selector_stats_enabled() or _sparse_kv_debug_enabled():
             logger.info(
                 "[aissd-selector-op] run layer=%s layer_id=%s generation=%s "
@@ -5402,7 +5561,13 @@ def _maybe_run_aissd_selector_op(
                 exc,
                 exc_info=True,
             )
-    if layer_reuse_enabled and layer_reuse_strategy == "static":
+    cache_for_static_layer_reuse = (
+        layer_reuse_enabled and layer_reuse_strategy == "static"
+    )
+    cache_for_independent_token_reuse = (
+        not layer_reuse_enabled and cross_token_reuse_enabled
+    )
+    if cache_for_static_layer_reuse or cache_for_independent_token_reuse:
         cache_t0 = time.perf_counter()
         _aissd_cache_selected_metadata(
             step_context,
@@ -5418,12 +5583,13 @@ def _maybe_run_aissd_selector_op(
         if overhead_log_enabled:
             logger.info(
                 "[aissd-token-reuse-overhead] op=cache layer=%s layer_id=%s "
-                "generation=%s strategy=%s state_ms=%.6f cache_ms=%.6f "
-                "copy_count=%s copy_bytes=%s token_step=%s",
+                "generation=%s strategy=%s layer_reuse=%s state_ms=%.6f "
+                "cache_ms=%.6f copy_count=%s copy_bytes=%s token_step=%s",
                 layer_name,
                 layer_id,
                 generation,
                 token_reuse_strategy,
+                int(layer_reuse_enabled),
                 token_state_ms,
                 cache_ms,
                 step_context.get("aissd_token_reuse_cache_copy_count", 0),
