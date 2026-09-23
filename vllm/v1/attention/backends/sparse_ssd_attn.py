@@ -47,9 +47,53 @@ from vllm import _custom_ops as vllm_ops
 logger = init_logger(__name__)
 
 
+_AISSD_MODEL_PROFILES: dict[str, tuple[int, int, int]] = {
+    # (num_q_heads, num_kv_heads, head_size)
+    "qwen3_4b": (32, 8, 128),
+    "qwen3_14b_awq": (40, 8, 128),
+}
+
+
 def _env_flag(name: str, default: str = "0") -> bool:
     value = os.environ.get(name, default)
     return str(value).lower() not in ("0", "false", "no", "off")
+
+
+def _aissd_validate_runtime_model_profile(
+    *, num_heads: int, num_kv_heads: int, head_size: int
+) -> str:
+    profile = str(
+        os.environ.get("AISSD_SPARSE_KV_MODEL_PROFILE")
+        or os.environ.get("AISSD_QKPACK_MODEL_PROFILE")
+        or "auto"
+    ).strip().lower()
+    geometry = (int(num_heads), int(num_kv_heads), int(head_size))
+    if min(geometry) <= 0 or geometry[0] % geometry[1]:
+        raise RuntimeError(
+            "invalid sparse-KV model geometry "
+            f"Hq={geometry[0]} Hkv={geometry[1]} D={geometry[2]}"
+        )
+    if profile != "auto":
+        if profile not in _AISSD_MODEL_PROFILES:
+            raise RuntimeError(
+                f"unsupported AISSD sparse-KV model profile={profile!r}; "
+                f"known={sorted(_AISSD_MODEL_PROFILES)} or use 'auto'"
+            )
+        if geometry != _AISSD_MODEL_PROFILES[profile]:
+            raise RuntimeError(
+                f"AISSD model profile={profile!r} expects "
+                f"(Hq,Hkv,D)={_AISSD_MODEL_PROFILES[profile]}, runtime={geometry}"
+            )
+    return profile
+
+
+def _aissd_abi_identity_sha256(abi: dict[str, Any]) -> str:
+    canonical = dict(abi)
+    canonical.pop("abi_identity_sha256", None)
+    payload = json.dumps(
+        canonical, sort_keys=True, separators=(",", ":"), ensure_ascii=False
+    ).encode("utf-8")
+    return hashlib.sha256(payload).hexdigest()
 
 
 def _sparse_debug_counters_enabled() -> bool:
@@ -2773,6 +2817,36 @@ def _aissd_selector_quality_int16_abi_metadata(
         abi = json.load(f)
     if not isinstance(abi, dict):
         raise RuntimeError(f"INT16 ABI root is not an object: {abi_path}")
+    declared_identity = str(abi.get("abi_identity_sha256") or "").strip()
+    actual_identity = _aissd_abi_identity_sha256(abi)
+    if declared_identity and declared_identity != actual_identity:
+        raise RuntimeError(
+            "INT16 ABI identity mismatch: "
+            f"declared={declared_identity} actual={actual_identity}"
+        )
+    if int(abi.get("schema_version", 1)) >= 2 and not declared_identity:
+        raise RuntimeError("INT16 ABI schema_version>=2 lacks abi_identity_sha256")
+    model_profile = str(abi.get("model_profile") or "legacy").strip().lower()
+    abi_num_layers = int(abi.get("num_layers") or 0)
+    abi_num_q_heads = int(abi.get("num_q_heads") or 0)
+    abi_num_kv_heads = int(abi.get("num_kv_heads") or 0)
+    abi_head_dim = int(abi.get("head_dim") or 0)
+    profile_geometry = {
+        "qwen3_4b": (36, 32, 8, 128),
+        "qwen3_14b_awq": (40, 40, 8, 128),
+    }
+    if model_profile in profile_geometry:
+        actual_geometry = (
+            abi_num_layers,
+            abi_num_q_heads,
+            abi_num_kv_heads,
+            abi_head_dim,
+        )
+        if actual_geometry != profile_geometry[model_profile]:
+            raise RuntimeError(
+                f"INT16 ABI profile={model_profile!r} geometry={actual_geometry} "
+                f"expected={profile_geometry[model_profile]}"
+            )
 
     default_bucket = int(abi.get("reference_bucket", 128))
     bucket = _aissd_env_int(
@@ -2811,6 +2885,10 @@ def _aissd_selector_quality_int16_abi_metadata(
 
     return {
         "abi_path": os.path.abspath(abi_path),
+        "abi_identity_sha256": declared_identity or actual_identity,
+        "model_profile": model_profile,
+        "num_layers": abi_num_layers,
+        "num_q_heads": abi_num_q_heads,
         "bucket": int(bucket),
         "chunk_size": int(abi["chunk_size"]),
         "num_kv_heads": int(abi["num_kv_heads"]),
@@ -2975,6 +3053,12 @@ def _aissd_selector_quality_build_int16_abi_reference(
         )
     if hq <= 0 or hq % hkv:
         raise RuntimeError(f"INT16 ABI invalid GQA Hq={hq} Hkv={hkv}")
+    if int(meta.get("num_q_heads") or 0) not in (0, hq):
+        raise RuntimeError(
+            "INT16 ABI num_q_heads does not match runtime: "
+            f"abi={meta.get('num_q_heads')} runtime={hq} "
+            f"profile={meta.get('model_profile')!r}"
+        )
     if int(meta["q"]["width"]) != hq or int(meta["q"]["ori_channels"]) != hkv * dim:
         raise RuntimeError("INT16 ABI q_block shape does not match runtime Q")
     if int(meta["k"]["width"]) != hkv * dim:
@@ -6526,6 +6610,11 @@ class SparseSSDAttentionImpl(AttentionImpl[AttentionMetadata]):
         self.head_size = head_size
         self.scale = scale
         self.num_kv_heads = num_heads if num_kv_heads is None else num_kv_heads
+        self.aissd_model_profile = _aissd_validate_runtime_model_profile(
+            num_heads=int(num_heads),
+            num_kv_heads=int(self.num_kv_heads),
+            head_size=int(head_size),
+        )
         self.sliding_window = sliding_window
         self.kv_cache_dtype = kv_cache_dtype
         self.logits_soft_cap = logits_soft_cap
