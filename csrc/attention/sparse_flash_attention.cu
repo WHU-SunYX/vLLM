@@ -22,6 +22,7 @@
 #include <cstdlib>
 #include <dlfcn.h>
 #include <mutex>
+#include <memory>
 #include <stdexcept>
 #include <string>
 #include <vector>
@@ -439,16 +440,19 @@ void sparse_flash_attention(
 
 namespace {
 
-constexpr uint32_t AISSD_SPARSE_KV_PROTOCOL_VERSION = 2u;
+/* Native-extents wire ABI.  vLLM already kept this ABI locally before the
+ * c512 change.  Keep it local to the vLLM translation unit; the exported HOST
+ * ABI check below detects drift from aissd_sparse_kv_attention at startup. */
+constexpr uint32_t AISSD_SPARSE_KV_NATIVE_PROTOCOL_VERSION = 3u;
 constexpr uint32_t AISSD_SPARSE_KV_FLAG_Q_INLINE_CMB = (1u << 0);
 constexpr uint32_t AISSD_SPARSE_KV_FLAG_NATIVE_EXTENTS = (1u << 1);
-constexpr uint32_t AISSD_SPARSE_KV_FLAG_RESULT_INLINE_CMB = (1u << 2);
-constexpr int32_t CMD_SPARSE_KV_RUN_MANIFEST_LBA = 100;
-constexpr uint32_t AISSD_MAX_DIMS = 8;
-constexpr uint32_t AISSD_MAX_CANDIDATES = 256;
-constexpr uint32_t AISSD_MAX_EXTENTS_PER_CANDIDATE = 64;
-constexpr uint32_t AISSD_MAX_SELECTED_CHUNKS = 256;
-constexpr uint32_t AISSD_MAX_SELECTED_BLOCKS = 4096;
+constexpr uint32_t AISSD_SPARSE_KV_FLAG_RESULT_INLINE_CMB = (1u << 3);
+constexpr int32_t CMD_SPARSE_KV_RUN_NATIVE_EXTENTS = 103;
+constexpr uint32_t AISSD_SPARSE_KV_MAX_DIMS = 8;
+constexpr uint32_t AISSD_SPARSE_KV_MAX_CANDIDATES = 512;
+constexpr uint32_t AISSD_SPARSE_KV_MAX_EXTENTS_PER_CANDIDATE = 64;
+constexpr uint32_t AISSD_SPARSE_KV_MAX_SELECTED_CHUNKS = 256;
+constexpr uint32_t AISSD_SPARSE_KV_MAX_SELECTED_BLOCKS = 4096;
 
 #pragma pack(push, 1)
 struct AissdSparseKvExtent {
@@ -464,15 +468,15 @@ struct AissdSparseKvCandidate {
   uint32_t dtype;
   uint32_t fmt;
   uint32_t ndim;
-  uint32_t shape[AISSD_MAX_DIMS];
+  uint32_t shape[AISSD_SPARSE_KV_MAX_DIMS];
   uint64_t file_offset;
   uint64_t nbytes;
   uint32_t extent_count;
   uint32_t reserved0;
-  AissdSparseKvExtent extents[AISSD_MAX_EXTENTS_PER_CANDIDATE];
+  AissdSparseKvExtent extents[AISSD_SPARSE_KV_MAX_EXTENTS_PER_CANDIDATE];
 };
 
-struct AissdSparseKvRunReq {
+struct AissdSparseKvNativeRunReq {
   int32_t cmd;
   uint32_t version;
   uint64_t job_id;
@@ -496,7 +500,7 @@ struct AissdSparseKvRunReq {
   uint32_t manifest_block_size;
   uint32_t flags;
   uint32_t reserved1;
-  AissdSparseKvCandidate candidates[AISSD_MAX_CANDIDATES];
+  AissdSparseKvCandidate candidates[AISSD_SPARSE_KV_MAX_CANDIDATES];
 };
 
 struct AissdSparseKvRunResp {
@@ -512,14 +516,19 @@ struct AissdSparseKvRunResp {
   uint32_t chunk_size;
   uint32_t error_code;
   uint32_t reserved0;
-  uint32_t selected_chunk_ids[AISSD_MAX_SELECTED_CHUNKS];
-  float selected_chunk_scores[AISSD_MAX_SELECTED_CHUNKS];
-  uint32_t selected_block_ids[AISSD_MAX_SELECTED_BLOCKS];
+  uint32_t selected_chunk_ids[AISSD_SPARSE_KV_MAX_SELECTED_CHUNKS];
+  float selected_chunk_scores[AISSD_SPARSE_KV_MAX_SELECTED_CHUNKS];
+  uint32_t selected_block_ids[AISSD_SPARSE_KV_MAX_SELECTED_BLOCKS];
 };
 #pragma pack(pop)
 
+static_assert(sizeof(AissdSparseKvNativeRunReq) == 567400,
+              "unexpected AISSD native v3 request ABI size");
+static_assert(sizeof(AissdSparseKvRunResp) == 18488,
+              "unexpected AISSD native response ABI size");
+
 using AissdRunNativeExtentsFn = int (*)(const void*, uint32_t,
-                                        const AissdSparseKvRunReq*,
+                                        const AissdSparseKvNativeRunReq*,
                                         AissdSparseKvRunResp*, int);
 using AissdRpcInitFn = int (*)();
 
@@ -544,6 +553,16 @@ AissdClientApi& get_aissd_client() {
     api.run = reinterpret_cast<AissdRunNativeExtentsFn>(dlsym(api.handle, "aissd_sparse_kv_run_native_extents"));
     if (!api.run) {
       throw std::runtime_error("dlsym aissd_sparse_kv_run_native_extents failed");
+    }
+    using CheckAbiFn = int (*)(uint32_t, uint32_t, uint32_t);
+    auto check_abi = reinterpret_cast<CheckAbiFn>(
+        dlsym(api.handle, "aissd_sparse_kv_check_native_abi"));
+    if (!check_abi || check_abi(AISSD_SPARSE_KV_NATIVE_PROTOCOL_VERSION,
+                              sizeof(AissdSparseKvNativeRunReq),
+                              sizeof(AissdSparseKvRunResp)) != 0) {
+      throw std::runtime_error(
+          "AISSD native ABI mismatch: rebuild libaissd_sparse_kv_client.so "
+          "and vLLM from the same protocol header");
     }
     if (init) {
       const int rc = init();
@@ -916,8 +935,9 @@ void aissd_sparse_kv_select(
   for (int64_t r = 0; r < reqs; ++r) {
     const int64_t cand_n = aissd_elem_i64_cpu(cand_count_cpu, r);
     TORCH_CHECK(cand_n > 0, "aissd_sparse_kv_select: candidate_count is zero");
-    TORCH_CHECK(cand_n <= AISSD_MAX_CANDIDATES,
-                "aissd_sparse_kv_select: candidate_count exceeds protocol max");
+    TORCH_CHECK(cand_n <= AISSD_SPARSE_KV_MAX_CANDIDATES,
+                "aissd_sparse_kv_select: candidate_count=", cand_n,
+                " exceeds protocol max=", AISSD_SPARSE_KV_MAX_CANDIDATES);
 
     at::Tensor q_one = aissd_make_single_query_for_req(query, req_lens_cpu, r, reqs);
     TORCH_CHECK(q_one.dim() == 2 && q_one.size(0) == num_q_heads && q_one.size(1) == head_dim,
@@ -935,10 +955,11 @@ void aissd_sparse_kv_select(
     const uint32_t q_dtype = aissd_query_dtype_code(q_one);
     const uint32_t q_bytes = static_cast<uint32_t>(q_bytes_i64);
 
-    AissdSparseKvRunReq req{};
+    auto req_storage = std::make_unique<AissdSparseKvNativeRunReq>();
+    auto& req = *req_storage;
     AissdSparseKvRunResp resp{};
-    req.cmd = CMD_SPARSE_KV_RUN_MANIFEST_LBA;
-    req.version = AISSD_SPARSE_KV_PROTOCOL_VERSION;
+    req.cmd = CMD_SPARSE_KV_RUN_NATIVE_EXTENTS;
+    req.version = AISSD_SPARSE_KV_NATIVE_PROTOCOL_VERSION;
     req.job_id = aissd_job_id(layer_id, r);
     req.request_id = static_cast<uint64_t>(r + 1);
     req.layer_id = static_cast<uint32_t>(layer_id);
@@ -972,11 +993,11 @@ void aissd_sparse_kv_select(
       dst.dtype = static_cast<uint32_t>(aissd_elem2_i64_cpu(dtype_cpu, r, c));
       dst.fmt = static_cast<uint32_t>(aissd_elem2_i64_cpu(fmt_cpu, r, c));
       dst.ndim = static_cast<uint32_t>(aissd_elem2_i64_cpu(ndim_cpu, r, c));
-      for (uint32_t d = 0; d < AISSD_MAX_DIMS; ++d) {
+      for (uint32_t d = 0; d < AISSD_SPARSE_KV_MAX_DIMS; ++d) {
         dst.shape[d] = static_cast<uint32_t>(aissd_elem3_u64_cpu(shape_cpu, r, c, d));
       }
       const int64_t extent_n = aissd_elem2_i64_cpu(ext_count_cpu, r, c);
-      TORCH_CHECK(extent_n > 0 && extent_n <= AISSD_MAX_EXTENTS_PER_CANDIDATE,
+      TORCH_CHECK(extent_n > 0 && extent_n <= AISSD_SPARSE_KV_MAX_EXTENTS_PER_CANDIDATE,
                   "aissd_sparse_kv_select: invalid candidate extent_count");
       dst.extent_count = static_cast<uint32_t>(extent_n);
       uint64_t nbytes = 0;
@@ -1006,6 +1027,11 @@ void aissd_sparse_kv_select(
                 "aissd_sparse_kv_run_native_extents failed rc=", rc,
                 " status=", resp.status, " error_code=", resp.error_code);
 
+    TORCH_CHECK(resp.version == AISSD_SPARSE_KV_NATIVE_PROTOCOL_VERSION &&
+                    resp.selected_chunk_count <= AISSD_SPARSE_KV_MAX_SELECTED_CHUNKS &&
+                    resp.selected_chunk_count <= req.top_n_chunks &&
+                    resp.selected_chunk_count <= req.candidate_chunk_count,
+                "aissd_sparse_kv_select: invalid native response version/count");
     const int64_t rpc_capacity = aissd_rpc_selected_chunk_ids.size(1);
     TORCH_CHECK(static_cast<int64_t>(resp.selected_chunk_count) <= rpc_capacity,
                 "aissd_sparse_kv_select: SSD returned selected_chunk_count=",
