@@ -243,6 +243,7 @@ class Scheduler(SchedulerInterface):
             hash_block_size=hash_block_size,
             metrics_collector=self.kv_metrics_collector,
         )
+        self.kv_cache_manager.configure_aissd_residency(vllm_config)
         # Bind GPU block pool to the KV connector. This must happen after
         # kv_cache_manager is constructed so block_pool is available.
         if self.connector is not None:
@@ -507,6 +508,9 @@ class Scheduler(SchedulerInterface):
                 # allow the lower-priority requests to be scheduled.
                 req_index += 1
                 continue
+
+            # Previous synchronous worker output fences compute/archive before release.
+            self.kv_cache_manager.prepare_aissd_residency(request, num_new_tokens)
 
             # Schedule newly needed KV blocks for the request.
             with record_function_or_nullcontext("schedule: allocate_slots"):
@@ -1047,6 +1051,10 @@ class Scheduler(SchedulerInterface):
             finished_req_ids=self.finished_req_ids,
             free_encoder_mm_hashes=self.encoder_cache_manager.get_freed_mm_hashes(),
             new_block_ids_to_zero=new_block_ids_to_zero,
+        )
+
+        scheduler_output.aissd_resident_states = (
+            self.kv_cache_manager.aissd_resident_snapshots(num_scheduled_tokens)
         )
 
         # NOTE(Kuntai): this function is designed for multiple purposes:
@@ -2302,6 +2310,13 @@ class Scheduler(SchedulerInterface):
 
         if self.connector is not None:
             self.connector.update_connector_output(kv_connector_output)
+
+        ready = getattr(kv_connector_output.kv_connector_worker_meta,
+                        "aissd_resident_ready_prefixes", {})
+        if ready and self.kv_cache_manager._aissd_budget:
+            self.kv_cache_manager.aissd_mark_archive_ready(
+                {req: prefix for req, prefix in ready.items() if req in self.requests}
+            )
 
         # KV Connector:: update recv and send status from last step.
         for req_id in kv_connector_output.finished_recving or ():

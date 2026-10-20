@@ -1417,6 +1417,10 @@ class GPUModelRunner(
                 # Replace the existing block IDs with the new ones.
                 req_state.block_ids = new_block_ids
 
+            resident_state = scheduler_output.aissd_resident_states.get(req_id)
+            if resident_state is not None:
+                req_state.block_ids = (list(resident_state["logical_block_ids"]),)
+
             if req_index is None:
                 # The request is not in the persistent batch.
                 # The request was either preempted and resumed later, or was not
@@ -1436,7 +1440,9 @@ class GPUModelRunner(
 
             # Update the persistent batch.
             self.input_batch.num_computed_tokens_cpu[req_index] = num_computed_tokens
-            if new_block_ids is not None:
+            if resident_state is not None:
+                self.input_batch.block_table.add_row(req_state.block_ids, req_index)
+            elif new_block_ids is not None:
                 self.input_batch.block_table.append_row(new_block_ids, req_index)
 
             # For the last rank, we don't need to update the token_ids_cpu

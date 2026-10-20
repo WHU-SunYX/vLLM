@@ -6669,6 +6669,9 @@ class SparseSSDAttentionImpl(AttentionImpl[AttentionMetadata]):
         output_scale: torch.Tensor | None,
         output_block_scale: torch.Tensor | None,
     ) -> torch.Tensor:
+        connector = _get_sparse_connector()
+        if getattr(connector, "_resident_current", None):
+            raise RuntimeError("Dense attention cannot read a released resident KV prefix")
         return self._fallback_impl.forward(
             layer,
             query,
@@ -7087,6 +7090,11 @@ class SparseSSDAttentionImpl(AttentionImpl[AttentionMetadata]):
                     num_kv_heads=int(self.num_kv_heads),
                     attention_scale=float(self.scale),
                 )
+                resident_loader = step_context.get("aissd_resident_loader")
+                if step_context.get("aissd_resident_active", False):
+                    if not callable(resident_loader):
+                        raise RuntimeError("Resident KV has no selected-layer refill hook")
+                    resident_loader(step_context, _aissd_parse_layer_id(layer_name, step_context), kv_cache)
                 if _aissd_qk_calib_dense_baseline_enabled():
                     # Full LMCache retrieve was deliberately kept enabled by the
                     # calibration-aware adapter.  Use the normal dense

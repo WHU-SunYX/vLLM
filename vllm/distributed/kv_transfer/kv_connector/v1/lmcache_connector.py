@@ -186,6 +186,10 @@ class LMCacheConnectorV1(KVConnectorBase_V1):
             layer_name, kv_layer, attn_metadata, **kwargs
         )
 
+    def build_connector_worker_meta(self):
+        hook = getattr(self._lmcache_engine, "build_connector_worker_meta", None)
+        return hook() if hook is not None else None
+
     def wait_for_save(self):
         """
         Block until all the save operations is done. This is called

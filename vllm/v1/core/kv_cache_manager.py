@@ -8,6 +8,7 @@ from typing import Literal, overload
 
 from vllm.distributed.kv_events import BlockStored, KVCacheEvent
 from vllm.logger import init_logger
+from vllm.v1.core.aissd_resident_cache import ResidentBlockManagerMixin
 from vllm.v1.core.kv_cache_coordinator import get_kv_cache_coordinator
 from vllm.v1.core.kv_cache_metrics import KVCacheMetricsCollector
 from vllm.v1.core.kv_cache_utils import KVCacheBlock
@@ -107,7 +108,7 @@ class KVCacheBlocks:
         return KVCacheBlocks(tuple(() for _ in range(len(self.blocks))))
 
 
-class KVCacheManager:
+class KVCacheManager(ResidentBlockManagerMixin):
     def __init__(
         self,
         kv_cache_config: KVCacheConfig,
@@ -434,6 +435,7 @@ class KVCacheManager:
         Args:
             request: The request to free the blocks.
         """
+        self.free_aissd_residency(request.request_id)
         self.coordinator.free(request.request_id)
 
     def remove_skipped_blocks(
