@@ -7113,6 +7113,15 @@ class SparseSSDAttentionImpl(AttentionImpl[AttentionMetadata]):
                         output_block_scale,
                     )
                 if impl in ("fa_varlen", "flash", "flash_attn", "flashattention"):
+                    numeric_pending = None
+                    if os.environ.get("AISSD_RESIDENT_NUMERIC_TRACE_DIR", "").strip():
+                        from lmcache.integration.vllm.resident_numeric_trace import (
+                            before_attention, after_attention,
+                        )
+                        numeric_pending = before_attention(
+                            step_context, _aissd_parse_layer_id(layer_name, step_context),
+                            query, kv_cache,
+                        )
                     attn_t0 = time.perf_counter()
                     result = self._forward_sparse_fa_varlen(
                         layer,
@@ -7128,6 +7137,8 @@ class SparseSSDAttentionImpl(AttentionImpl[AttentionMetadata]):
                         layer_name,
                     )
                     attention_ms = (time.perf_counter() - attn_t0) * 1000.0
+                    if numeric_pending is not None:
+                        after_attention(numeric_pending, result)
                     step_context["sparse_attention_ms"] = float(attention_ms)
                     _log_sparse_kv_e2e_bandwidth(
                         step_context=step_context,
