@@ -5982,6 +5982,15 @@ def _maybe_run_aissd_selector_op(
         step_context["aissd_selector_real_layer"] = None
         return 0.0
 
+    coarse_plan = None
+    coarse_prepare = step_context.get("aissd_gpu_coarse_prepare")
+    if step_context.get("aissd_gpu_coarse_required") and not callable(coarse_prepare):
+        raise RuntimeError("GPU coarse is enabled but its pre-selector hook is missing")
+    if callable(coarse_prepare):
+        if layer_reuse_enabled or cross_token_reuse_enabled:
+            raise RuntimeError("GPU coarse v1 requires layer and token reuse disabled")
+        coarse_plan = coarse_prepare(
+            step_context, query, int(layer_id), int(num_heads), float(attention_scale))
     t0 = time.perf_counter()
     selector_prof = _sparse_profile_begin("aissd_selector_op", layer_name, query)
     vllm_ops.aissd_sparse_kv_select(
@@ -6026,6 +6035,11 @@ def _maybe_run_aissd_selector_op(
         int(step_context.get("aissd_manifest_block_size", 4096)),
         int(step_context.get("aissd_timeout_ms", 300000)),
     )
+    if coarse_plan is not None:
+        coarse_finish = step_context.get("aissd_gpu_coarse_finish")
+        if not callable(coarse_finish):
+            raise RuntimeError("GPU coarse completion hook is missing")
+        coarse_finish(step_context, coarse_plan)
     if q_drift_shadow_plan is not None:
         try:
             _aissd_q_drift_shadow_finalize(
