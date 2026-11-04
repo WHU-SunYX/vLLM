@@ -7007,6 +7007,16 @@ class SparseSSDAttentionImpl(AttentionImpl[AttentionMetadata]):
         output_block_scale: torch.Tensor | None = None,
     ) -> torch.Tensor:
         layer_name = getattr(layer, "layer_name", "")
+        connector = _get_sparse_connector()
+        if getattr(connector, "_resident_prefill_current", None):
+            import re
+
+            match = re.search(r"(?:^|\.)layers\.(\d+)(?:\.|$)", str(layer_name))
+            if match is None or output_scale is not None or output_block_scale is not None:
+                raise RuntimeError("AISSD staged prefill requires a numbered layer and BF16 output")
+            return connector._resident_prefill_forward(
+                self._fallback_impl.forward, int(match.group(1)), layer, query, key,
+                value, kv_cache, attn_metadata, output)
         step_context = _get_sparse_step_context(attn_metadata)
 
         if step_context is not None:

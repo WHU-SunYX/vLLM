@@ -321,6 +321,14 @@ class KVCacheManager(ResidentBlockManagerMixin):
         Returns:
             A list of new allocated blocks.
         """
+        if (getattr(self, "_aissd_staged_prefill", False)
+                and request.num_computed_tokens < request.num_prompt_tokens):
+            if (num_new_computed_tokens or num_lookahead_tokens or num_encoder_tokens
+                    or delay_cache_blocks or (new_computed_blocks is not None
+                    and any(new_computed_blocks.blocks))):
+                raise RuntimeError("AISSD staged prefill requires synchronous external KV only")
+            return self.allocate_aissd_prefill_slots(request, num_new_tokens,
+                                                      num_external_computed_tokens)
         # When loading KV data asynchronously, we may have zero new tokens to
         # compute while still allocating slots for externally computed tokens.
         if num_new_tokens == 0 and num_external_computed_tokens == 0:

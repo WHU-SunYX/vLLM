@@ -791,6 +791,20 @@ def estimate_max_model_len(
         vllm_config.model_config.max_model_len = original_max_model_len
 
 
+def _check_aissd_prefill_memory(vllm_config, bytes_per_block, available_memory):
+    from vllm.v1.core.aissd_resident_cache import (
+        staged_prefill_pool_blocks,
+        validate_resident_config,
+    )
+
+    validate_resident_config(vllm_config)
+    blocks = staged_prefill_pool_blocks(vllm_config)
+    needed = blocks * bytes_per_block
+    if available_memory < needed:
+        raise ValueError(f"AISSD staged prefill needs {blocks} GPU KV blocks "
+                         f"({needed} bytes); available={available_memory}")
+
+
 def check_enough_kv_cache_memory(
     vllm_config: VllmConfig,
     kv_cache_spec: dict[str, KVCacheSpec],
@@ -811,6 +825,15 @@ def check_enough_kv_cache_memory(
 
     # No need to check for available memory if the kv_cache_spec is empty
     if kv_cache_spec:
+        from vllm.v1.core.aissd_resident_cache import staged_prefill_enabled
+
+        if staged_prefill_enabled(vllm_config):
+            if any(type(spec) is not FullAttentionSpec for spec in kv_cache_spec.values()):
+                raise ValueError("AISSD staged prefill supports FullAttentionSpec only")
+            _check_aissd_prefill_memory(vllm_config,
+                                      sum(spec.page_size_bytes for spec in kv_cache_spec.values()),
+                                      available_memory)
+            return
         _check_enough_kv_cache_memory(
             available_memory,
             lambda: max_memory_usage_bytes(vllm_config, kv_cache_spec.values()),
@@ -2026,6 +2049,11 @@ def get_kv_cache_configs(
             adjusted_memory.append(override * bytes_per_block)
         available_memory = adjusted_memory
 
+    from vllm.v1.core.aissd_resident_cache import staged_prefill_enabled
+
+    staged = staged_prefill_enabled(vllm_config)
+    if staged and vllm_config.model_config.original_max_model_len == -1:
+        raise ValueError("AISSD staged prefill needs an explicit --max-model-len")
     if vllm_config.model_config.original_max_model_len == -1:
         _auto_fit_max_model_len(
             vllm_config, projected_groups_per_worker, available_memory
@@ -2034,6 +2062,11 @@ def get_kv_cache_configs(
     # Check if the available memory is enough per worker.
     for groups, avail_mem in zip(projected_groups_per_worker, available_memory):
         if not groups:
+            continue
+        if staged:
+            if len(groups) != 1 or type(groups[0].kv_cache_spec) is not FullAttentionSpec:
+                raise ValueError("AISSD staged prefill requires a single FullAttentionSpec group")
+            _check_aissd_prefill_memory(vllm_config, _pool_bytes_per_block(groups), avail_mem)
             continue
         _check_enough_kv_cache_memory(
             avail_mem,
