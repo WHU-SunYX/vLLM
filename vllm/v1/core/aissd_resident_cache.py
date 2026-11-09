@@ -26,6 +26,15 @@ def staged_prefill_enabled(config):
     return mode == "staged"
 
 
+def staged_prefill_prefetch_enabled(config):
+    transfer = getattr(config, "kv_transfer_config", None)
+    extra = getattr(transfer, "kv_connector_extra_config", None) or {}
+    enabled = extra.get("lmcache.aissd_gpu_prefill_prefetch", False)
+    if type(enabled) is not bool:
+        raise ValueError("lmcache.aissd_gpu_prefill_prefetch must be a JSON boolean")
+    return enabled
+
+
 def staged_prefill_live_blocks(config):
     """Max live pages of one prefill step, excluding the shared null page."""
     _, chunk, _ = resident_options(config)
@@ -43,6 +52,8 @@ def staged_prefill_pool_blocks(config):
 def validate_resident_config(config):
     budget, chunk, topn = resident_options(config)
     staged = staged_prefill_enabled(config)
+    if staged_prefill_prefetch_enabled(config) and not staged:
+        raise ValueError("AISSD prefill prefetch requires aissd_gpu_prefill_mode=staged")
     if budget == 0:
         if staged:
             raise ValueError("AISSD staged prefill requires a positive resident budget")
